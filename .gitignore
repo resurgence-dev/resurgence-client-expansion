@@ -1,0 +1,4 @@
+module/build/
+# build_module.bat output: the module, openvr_api.dll and the CMake tree.
+module/builds/
+module/third_party/
