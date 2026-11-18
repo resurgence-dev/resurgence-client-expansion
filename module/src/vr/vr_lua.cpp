@@ -578,6 +578,17 @@ namespace rcx::vr
 				SetNumber(lua, fingers[finger], skeleton.curl[finger]);
 			}
 
+			lua->CreateTable();
+
+			for (int gap = 0; gap < 4; gap++)
+			{
+				lua->PushNumber(gap + 1);
+				lua->PushNumber(skeleton.splay[gap]);
+				lua->SetTable(-3);
+			}
+
+			lua->SetField(-2, "splay");
+
 			return 1;
 		}
 

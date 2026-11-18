@@ -20,7 +20,7 @@ namespace
 		const char* set = nullptr;
 	};
 
-	// gamemode/plugins/vr/cl_input.lua's list as a 0.55 module gets it: the press types as binding suffixes.
+	// gamemode/plugins/vr/cl_input.lua's list as a 0.57 module gets it: the press types as binding suffixes, the chord as both_.
 	const TestAction kActions[] = {
 		{"move", "vector2", "left_stick", "Move", "main"},
 		{"turn", "vector2", "right_stick", "Turn", "main"},
@@ -29,20 +29,22 @@ namespace
 		{"jump", "boolean", "right_a", "Jump", "main"},
 		{"pipboy", "boolean", "left_b", "Open Pip-Boy", "main"},
 		{"menu", "boolean", "left_a_single", "Game menu", "main"},
-		{"quick_select_left", "boolean", "left_a_long", "Favorites, left hand", "main"},
-		{"quick_select_right", "boolean", "", "Favorites, right hand", "main"},
-		{"ui_toggle", "boolean", "right_b", "Show or hide the UI window", "main"},
+		{"weapon_menu", "boolean", "left_a_long", "Weapon menu", "main"},
+		{"quick_select_left", "boolean", "", "Favorites, left hand", "main"},
+		{"quick_select_right", "boolean", "right_b_long", "Favorites, right hand", "main"},
+		{"ui_toggle", "boolean", "right_b_single", "Show or hide the UI window", "main"},
 		{"use", "boolean", "left_trigger", "Use (what the hand points at)", "main"},
-		{"reload", "boolean", "right_b_single", "Reload", "weapon"},
-		{"weapon_menu", "boolean", "right_b_long", "Weapon menu", "weapon"},
-		{"ammo_next", "boolean", "right_b_double", "Next ammo type", "weapon"},
 		{"trigger_left", "vector1", "left_trigger", "Left trigger", "main"},
 		{"trigger_right", "vector1", "right_trigger", "Right trigger", "main"},
-		{"click_left", "boolean", "left_trigger", "Left click", "pointer"},
-		{"click_right", "boolean", "right_trigger", "Right click", "pointer"},
 		{"grip_left", "vector1", "left_grip", "Left grip", "main"},
 		{"grip_right", "vector1", "right_grip", "Right grip", "main"},
-		{"recenter", "boolean", "", "Recenter the view", ""},
+		{"recenter", "boolean", "", "Recenter the view", "main"},
+		{"tuning_menu", "boolean", "both_stick_click", "Tuning menu", "main"},
+		{"reload", "boolean", "right_b_single", "Reload", "weapon"},
+		{"ammo_next", "boolean", "right_b_double", "Next ammo type", "weapon"},
+		{"quick_select_weapon", "boolean", "right_b_long", "Favorites, weapon hand", "weapon"},
+		{"click_left", "boolean", "left_trigger", "Left click", "pointer"},
+		{"click_right", "boolean", "right_trigger", "Right click", "pointer"},
 	};
 }
 
@@ -84,6 +86,18 @@ int main()
 	if (rcx::vr::input::RegisterAction("bad_press", "boolean", "left_a_triple", "", "", reason))
 	{
 		std::printf("FAIL an unknown press type was taken\n");
+		failures++;
+	}
+
+	if (rcx::vr::input::RegisterAction("bad_chord", "vector2", "both_stick", "", "", reason))
+	{
+		std::printf("FAIL a chord on a stick was taken\n");
+		failures++;
+	}
+
+	if (rcx::vr::input::RegisterAction("bad_chord", "boolean", "both_a_long", "", "", reason))
+	{
+		std::printf("FAIL a press type on a chord was taken\n");
 		failures++;
 	}
 

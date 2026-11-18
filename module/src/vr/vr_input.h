@@ -46,6 +46,8 @@ namespace rcx::vr::input
 	{
 		// thumb, index, middle, ring, pinky: 0 straight, 1 fully curled
 		float curl[5]{};
+		// the gaps thumb-index, index-middle, middle-ring, ring-pinky: 0 together, 1 fully spread
+		float splay[4]{};
 	};
 
 	constexpr size_t kMaxActions = 48;

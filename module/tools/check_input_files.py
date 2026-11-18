@@ -4,8 +4,10 @@ valid JSON, every action and set has a display name, each controller's bindings 
 declared actions, no input is bound twice within one set, and reload and ui_toggle (both on the
 right B button) land in different sets. Press types (single, double, long, held) sit only on
 "button" mode sources, never beside a plain click, with both press delays set; on the Index and
-Touch, menu, quick_select_left, reload, weapon_menu and ammo_next have theirs. Run by
-tools/build_module.ps1 after the exe.
+Touch, W8's layout has its presses (menu and weapon_menu on left A, ui_toggle and
+quick_select_right on right B, reload, ammo_next and quick_select_weapon on right B in the weapon set). Chords point only at
+declared actions with two inputs, and on the Index and Touch tuning_menu is the chord of both
+thumbstick clicks. Run by tools/build_module.ps1 after the exe.
 """
 import json
 import os
@@ -75,6 +77,13 @@ for entry in manifest["default_bindings"]:
             if timed and ("long_press_delay" not in parameters or "double_press_delay" not in parameters):
                 failures.append(entry["controller_type"] + ": no press delays on " + source["path"])
 
+        for chord in set_bindings.get("chords", []):
+            if chord["output"] not in actions:
+                failures.append(entry["controller_type"] + ": chord output " + chord["output"] + " isn't declared")
+
+            if len(chord.get("inputs", [])) != 2 or any(len(pair) != 2 for pair in chord["inputs"]):
+                failures.append(entry["controller_type"] + ": chord " + chord["output"] + " needs two [path, component] inputs")
+
         for item in set_bindings.get("skeleton", []) + set_bindings.get("haptics", []):
             if item["output"] not in actions:
                 failures.append(entry["controller_type"] + ": output " + item["output"] + " isn't declared")
@@ -84,10 +93,12 @@ for entry in manifest["default_bindings"]:
     if entry["controller_type"] in ("knuckles", "oculus_touch"):
         wanted = {
             "/actions/main/in/menu": "single",
-            "/actions/main/in/quick_select_left": "long",
+            "/actions/main/in/weapon_menu": "long",
+            "/actions/main/in/ui_toggle": "single",
+            "/actions/main/in/quick_select_right": "long",
             "/actions/weapon/in/reload": "single",
-            "/actions/weapon/in/weapon_menu": "long",
             "/actions/weapon/in/ammo_next": "double",
+            "/actions/weapon/in/quick_select_weapon": "long",
         }
         found = {}
 
@@ -99,6 +110,14 @@ for entry in manifest["default_bindings"]:
         for action, component in wanted.items():
             if found.get(action) != component:
                 failures.append(entry["controller_type"] + ": " + action + " is on " + repr(found.get(action)) + ", not " + component)
+
+        chords = bindings["bindings"].get("/actions/main", {}).get("chords", [])
+        tuning = [chord for chord in chords if chord["output"] == "/actions/main/in/tuning_menu"]
+        stick = "/input/thumbstick" if entry["controller_type"] == "knuckles" else "/input/joystick"
+        wanted_inputs = [["/user/hand/left" + stick, "click"], ["/user/hand/right" + stick, "click"]]
+
+        if len(tuning) != 1 or tuning[0]["inputs"] != wanted_inputs:
+            failures.append(entry["controller_type"] + ": tuning_menu isn't the chord of both thumbstick clicks: " + json.dumps(tuning))
 
     for action in ("/actions/main/in/ui_toggle", "/actions/weapon/in/reload"):
         if action not in outputs:

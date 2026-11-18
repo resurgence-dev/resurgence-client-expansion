@@ -71,11 +71,14 @@ namespace rcx::vr::input
 			Held
 		};
 
+		// chord: the slot on both hands at once (a "both_" binding), written to the set's "chords"
+		// instead of its sources.
 		struct Binding
 		{
 			int side = 0;
 			Slot slot = Slot::None;
 			Press press = Press::Click;
+			bool chord = false;
 		};
 
 		// The press timings written on a source that has a double, long or held input (seconds).
@@ -301,7 +304,12 @@ namespace rcx::vr::input
 				}
 			}
 
-			if (body.compare(0, 5, "left_") == 0)
+			if (body.compare(0, 5, "both_") == 0)
+			{
+				binding.chord = true;
+				slotName = body.substr(5);
+			}
+			else if (body.compare(0, 5, "left_") == 0)
 			{
 				binding.side = 0;
 				slotName = body.substr(5);
@@ -363,12 +371,17 @@ namespace rcx::vr::input
 			return false;
 		}
 
-		// A press type goes only on a face button, for a boolean action.
+		// A press type goes only on a face button, for a boolean action; a chord takes only the plain click.
 		bool PressFitsSlot(ActionKind kind, const Binding& binding)
 		{
 			if (binding.press == Press::Click)
 			{
 				return true;
+			}
+
+			if (binding.chord)
+			{
+				return false;
 			}
 
 			return kind == ActionKind::Boolean && (binding.slot == Slot::A || binding.slot == Slot::B);
@@ -514,7 +527,7 @@ namespace rcx::vr::input
 
 			for (const Action& action : actions)
 			{
-				if (action.set != set)
+				if (action.set != set || action.binding.chord)
 				{
 					continue;
 				}
@@ -597,6 +610,47 @@ namespace rcx::vr::input
 			return json;
 		}
 
+		// One set's chords on one controller: each "both_" action as its slot's boolean input on both hands.
+		// A slot this controller lacks, or with no boolean input, leaves the action out.
+		std::string ChordsJson(const ControllerProfile& profile, int set)
+		{
+			std::string json;
+
+			for (const Action& action : actions)
+			{
+				if (action.set != set || !action.binding.chord || action.kind != ActionKind::Boolean)
+				{
+					continue;
+				}
+
+				Binding left = action.binding;
+				Binding right = action.binding;
+				left.side = 0;
+				right.side = 1;
+
+				const SlotSpelling* leftSpelling = Spell(profile, left);
+				const SlotSpelling* rightSpelling = Spell(profile, right);
+
+				if (leftSpelling == nullptr || rightSpelling == nullptr || leftSpelling->path == nullptr || rightSpelling->path == nullptr)
+				{
+					continue;
+				}
+
+				std::string leftComponent = leftSpelling->booleanComponent;
+				std::string rightComponent = rightSpelling->booleanComponent;
+
+				if (leftComponent.empty() || rightComponent.empty())
+				{
+					continue;
+				}
+
+				json += json.empty() ? "\n" : ",\n";
+				json += "\t\t\t\t{\"output\": \"" + ActionPath(action) + "\", \"inputs\": [[\"" + std::string(kHandPaths[0]) + leftSpelling->path + "\", \"" + leftComponent + "\"], [\"" + std::string(kHandPaths[1]) + rightSpelling->path + "\", \"" + rightComponent + "\"]]}";
+			}
+
+			return json.empty() ? std::string() : ",\n\t\t\t\"chords\": [" + json + "\n\t\t\t]";
+		}
+
 		// One controller's default bindings: each of Lua's sets, then the module's skeletons and haptics.
 		std::string BuildBindings(const ControllerProfile& profile)
 		{
@@ -607,7 +661,7 @@ namespace rcx::vr::input
 
 			for (int set = 0; set < kSetCount; set++)
 			{
-				json += "\t\t\"" + SetPath(set) + "\": {\n\t\t\t" + SourcesJson(BuildSources(profile, set)) + "\n\t\t},\n";
+				json += "\t\t\"" + SetPath(set) + "\": {\n\t\t\t" + SourcesJson(BuildSources(profile, set)) + ChordsJson(profile, set) + "\n\t\t},\n";
 			}
 
 			json += "\t\t\"" + std::string(kModuleSet) + "\": {\n\t\t\t\"skeleton\": [\n";
@@ -926,13 +980,19 @@ namespace rcx::vr::input
 
 		if (!ParseBinding(bindingText, binding))
 		{
-			reason = "binding must be left_ or right_ followed by stick, stick_click, trigger, grip, a or b, and optionally _single, _double, _long or _held";
+			reason = "binding must be left_, right_ or both_ followed by stick, stick_click, trigger, grip, a or b, and optionally _single, _double, _long or _held";
 			return false;
 		}
 
 		if (!PressFitsSlot(kind, binding))
 		{
-			reason = "a press type (_single, _double, _long, _held) goes only on a or b, for a boolean action";
+			reason = "a press type (_single, _double, _long, _held) goes only on a or b, for a boolean action, and never on a both_ chord";
+			return false;
+		}
+
+		if (binding.chord && (kind != ActionKind::Boolean || binding.slot == Slot::Stick))
+		{
+			reason = "a both_ chord is a boolean action on a button: stick_click, trigger, grip, a or b";
 			return false;
 		}
 
@@ -949,7 +1009,7 @@ namespace rcx::vr::input
 				continue;
 			}
 
-			bool sameBinding = action.binding.side == binding.side && action.binding.slot == binding.slot && action.binding.press == binding.press;
+			bool sameBinding = action.binding.side == binding.side && action.binding.slot == binding.slot && action.binding.press == binding.press && action.binding.chord == binding.chord;
 
 			if (action.kind != kind || !sameBinding || action.label != label || action.set != set)
 			{
@@ -1179,6 +1239,11 @@ namespace rcx::vr::input
 			for (int finger = 0; finger < 5; finger++)
 			{
 				skeletons[hand].curl[finger] = summary.flFingerCurl[finger];
+
+				if (finger < 4)
+				{
+					skeletons[hand].splay[finger] = summary.flFingerSplay[finger];
+				}
 			}
 		}
 	}
