@@ -1,0 +1,148 @@
+# Builds the module for a pushed v* tag, runs its checks and publishes the two DLLs as the tag's
+# GitHub release. How to cut a release: README.md, Releases.
+#
+# The repository is public, so: only a tag push triggers this (never a pull request or another
+# workflow, so a fork can't reach the write token), the token is read-only except in the release
+# job, which runs none of the repository's code, no secret but GITHUB_TOKEN is used, and every
+# action is pinned to a commit.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  # Pinned by commit so a moving upstream can't change a release. Update both together with the
+  # README's clone commands.
+  OPENVR_REPO: ValveSoftware/openvr
+  OPENVR_REF: 0924064316de3effbcd1acf1e309182a2deb1c05 # tag v2.15.6
+  GMOD_BASE_REPO: Facepunch/gmod-module-base
+  GMOD_BASE_REF: e0156e5f96cd0bad8eed738f0d20e2c9a14b2a0d # development branch, 2023-10-27 (master crashes on require)
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Check out the module
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the tag against kVersion
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $tag = $env:TAG
+          if ($tag -notmatch '^v(\d+)\.(\d+)$') {
+            Write-Host "::error::tag $tag is not vX.YY"
+            exit 1
+          }
+          $major = [int]$Matches[1]
+          $version = $tag.Substring(1)
+          $source = Get-Content module/src/module.cpp -Raw
+          if (-not $source.Contains("kVersion = `"rcx $version (")) {
+            $found = [regex]::Match($source, 'kVersion = "rcx ([0-9.]+)').Groups[1].Value
+            Write-Host "::error::tag $tag doesn't match kVersion in module/src/module.cpp (rcx $found)"
+            exit 1
+          }
+          $prerelease = ($major -lt 1).ToString().ToLowerInvariant()
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "prerelease=$prerelease" >> $env:GITHUB_OUTPUT
+          Write-Host "rcx $version, pre-release: $prerelease"
+
+      - name: Fetch the OpenVR SDK
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.OPENVR_REPO }}
+          ref: ${{ env.OPENVR_REF }}
+          path: module/third_party/openvr
+          persist-credentials: false
+          # the build uses only these; the samples have paths past Windows' 260-character limit
+          sparse-checkout: |
+            headers
+            bin/win64
+
+      - name: Fetch gmod-module-base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.GMOD_BASE_REPO }}
+          ref: ${{ env.GMOD_BASE_REF }}
+          path: module/third_party/gmod-module-base
+          persist-credentials: false
+
+      - name: Set up Python for the input files check
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # The local build script without -Install: Release, x64, MSVC through Visual Studio's CMake,
+      # then the IK tests, the input-file test and tools/check_input_files.py. Any failure exits 1.
+      - name: Build and check
+        run: ./module/tools/build_module.ps1 -Clean
+
+      - name: Gather the release files
+        run: |
+          New-Item -ItemType Directory release | Out-Null
+          foreach ($name in "gmcl_rcx_win64.dll", "openvr_api.dll") {
+            if (-not (Test-Path "module/builds/win64/$name")) {
+              Write-Host "::error::module/builds/win64/$name was not built"
+              exit 1
+            }
+            Copy-Item "module/builds/win64/$name" release/
+          }
+          Copy-Item .github/release-install.md release/
+
+      - name: Keep the release files for the release job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: release/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Fetch the release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: release
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          $files = "release/gmcl_rcx_win64.dll", "release/openvr_api.dll"
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # made by hand (as v0.60 was): keep its title and notes, attach or replace the DLLs
+            Write-Host "release $env:TAG exists, uploading the files to it"
+            gh release upload $env:TAG @files --clobber
+          } else {
+            $flags = @()
+            if ($env:PRERELEASE -eq "true") { $flags += "--prerelease" }
+            gh release create $env:TAG @files --verify-tag --title "RCX Alpha $env:VERSION" --notes-file release/release-install.md --generate-notes @flags
+          }
+          if ($LASTEXITCODE -ne 0) { exit 1 }

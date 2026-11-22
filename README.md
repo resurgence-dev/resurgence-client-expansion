@@ -3,7 +3,10 @@
 An optional client binary module for Garry's Mod, `gmcl_rcx_win64.dll`, loaded with
 `require("rcx")`. It gives client Lua what Lua can't do on its own. Its first component is VR
 (`rcx.vr`): an OpenVR session, head and hand poses, and the game's picture handed to the headset.
-The second is a body IK solver (`rcx.ik`), pure math with no engine access.
+The second is a body IK solver (`rcx.ik`), pure math with no engine access. The third is
+render-thread and GPU timing (`rcx.gpu`, since 0.61), measurement only. Since 0.62 it carries the
+safety layer for components that rely on engine internals (`rcx.engine`), ahead of the first one,
+merged meshes (`mesh_combine`, being built).
 The designs are `docs/client-expansion-design.md` and `docs/vr-design.md` in the Resurgence
 gamemode; this addon is the module and a standalone testbed, and runs in any gamemode.
 
@@ -12,8 +15,11 @@ Windows x64 only (the 64-bit game branch). The game never needs it: Lua checks `
 
 ## What loading does
 
-Nothing but create the `rcx` table. Loading installs no hooks and loads no third-party DLL. The
-Direct3D 9 hooks go in and `openvr_api.dll` is loaded only when Lua calls `rcx.vr.Start()`
+Create the `rcx` table and run the engine features' build check (below, Engine features): it reads
+`engine.dll`, `datacache.dll` and `studiorender.dll` from the files the game loaded them from, and
+`rcx_policy.json` and `rcx_state/` next to the module, and changes nothing. Loading installs no hooks and loads no third-party DLL. The
+Direct3D 9 hooks go in only when Lua calls `rcx.vr.Start()` or `rcx.gpu.Start()`, and `openvr_api.dll`
+is loaded only by `rcx.vr.Start()`
 (`rcx.vr.IsHeadsetPresent()` also loads `openvr_api.dll`, to ask the runtime).
 
 ## Lua API
@@ -49,6 +55,40 @@ Direct3D 9 hooks go in and `openvr_api.dll` is loaded only when Lua calls `rcx.v
 | `rcx.vr.HideKeyboard()`, `rcx.vr.IsKeyboardOpen()` | Closes it (a `keyboard_closed` event follows); whether it is open |
 | `rcx.vr.SetKeyboardPose(x, y, z, yaw, pitch)` | Places the keyboard in SteamVR's standing space: meters (Y up, -Z forward), then yaw about Y and pitch about the keyboard's sideways axis in degrees (since 0.55; not seen in a headset) |
 | `rcx.vr.PollEvents()` | The events since the last call, oldest first, each `{type, value}` and for the keyboard `text`: `quit`, `dashboard_open`, `dashboard_close`, `ipd_changed` (value: meters), `play_area_changed`, `controllers_changed`, `input_focus_changed`, `headset_disconnected`; since 0.55 `keyboard_char` (text: what was typed, `"\b"` backspace, `"\n"` enter, an escape sequence such as `"\x1b[D"` for an arrow), `keyboard_done` (text: SteamVR's copy of the text, empty in minimal mode, where it keeps none) and `keyboard_closed` (after done, or canceled). At most 64 are kept |
+
+## GPU timing
+
+`rcx.gpu` (since 0.61) times each frame where the game presents it, through the same Direct3D 9
+hooks as VR (no engine internals), so harness tests can tell whether the render thread or the GPU
+is the limit (`docs/rcx-engine-hooks-design.md` in the gamemode, candidate 12). A frame runs from
+one Present's return to the next Present's call, on the thread that presents: the render thread
+with `mat_queue_mode 2`. Times are milliseconds. Its convar is `rcx_gpu`.
+
+| Call | Does |
+|---|---|
+| `rcx.gpu.Start()` | Installs the Direct3D 9 hooks if they aren't in yet and starts timing; clears the window. True, or false and a reason (the convar, no Direct3D 9) |
+| `rcx.gpu.Stop()` | Stops timing; the queries are released at the next Present, on the device's thread |
+| `rcx.gpu.IsRunning()` | Whether it is timing |
+| `rcx.gpu.GetLast()` | The last frame: `frame` (its number), `presentInterval`, `presentBlock`, `renderWall`, `renderBusy`, and the last GPU frame read, `gpuFrame`, `gpuSpan`, `gpuInterval` (a few frames behind `frame`) |
+| `rcx.gpu.BeginWindow()` | Clears the window's samples |
+| `rcx.gpu.GetWindow()` | Since `BeginWindow` (or `Start`): `seconds`, `frames`, `gpuFrames`, `gpuDropped` (sets reused before the GPU reached them), `disjoint`, `truncated` (past 20,000 samples a metric), and per metric a `{count, mean, p50, p95, max}` table |
+| `rcx.gpu.GetStatus()` | `running`, `deviceFound`, `queriesReady`, `queryError` when the device has no timestamp queries, `presentOnMainThread`, `busyCalibrated`, `cyclesPerMs`, `frames`, `gpuFrames`, `gpuDropped`, `disjoint`, `resets`, `threadChanges` |
+
+The metrics:
+
+- `presentInterval`: from one Present call to the next, the rate frames go out.
+- `presentBlock`: time inside the real Present; long when the GPU or the swap chain holds the frame back.
+- `renderWall`: from a Present's return to the next Present's call: the presenting thread's work plus its waits for the main thread's queue.
+- `renderBusy`: the presenting thread's own CPU time over `renderWall` (`QueryThreadCycleTime`, converted with the TSC rate measured against the performance counter over the first 250 ms), so `renderWall - renderBusy` is about what it waited.
+- `gpuSpan`: GPU timestamps at the frame's first and last command (`D3DQUERYTYPE_TIMESTAMP`, inside a `TIMESTAMPDISJOINT` pair), read without a flush, usually 2-3 frames late. It counts any time the GPU sat idle between them, so it is the GPU's frame only when the GPU is the limit.
+- `gpuInterval`: from one frame's first GPU timestamp to the next one's.
+
+Reading them: the GPU is the limit when `presentBlock` is long and `gpuSpan` is close to
+`gpuInterval`; the render thread is when `renderBusy` is close to `presentInterval`; the main
+thread is when `renderWall` is much longer than `renderBusy` (the render thread waits for work).
+A thread change (the device presented from another thread) or a device reset starts the counts
+again. Eight query sets are in flight at most; a GPU further behind than that drops a frame's
+timing (`gpuDropped`).
 
 `rcx.ik` honors its convar `rcx_ik` through `rcx.Features()` only: a pure solver has nothing to protect,
 and reading the convar on every call would cost more than the solve.
@@ -165,7 +205,83 @@ The module links the static C runtime and imports only `kernel32` and `user32`; 
 
 ## Installing
 
-`module/build_module.bat -Install`, or copy `gmcl_rcx_win64.dll` and `openvr_api.dll` into `garrysmod/lua/bin`. VR needs SteamVR.
+`module/build_module.bat -Install`, or copy `gmcl_rcx_win64.dll` and `openvr_api.dll` (from a
+build or a [release](https://github.com/resurgence-dev/resurgence-client-expansion/releases)) into
+`garrysmod/lua/bin`. VR needs SteamVR.
+
+## Releases
+
+`.github/workflows/release.yml` builds and publishes a release when a `v*` tag is pushed. To cut one:
+
+1. Bump `kVersion` in `module/src/module.cpp` and commit.
+2. Tag that commit with the same number and push the tag: `git tag -a v0.61 -m "rcx 0.61"`, then
+   `git push origin v0.61`.
+
+The repository is public, so the workflow keeps the token's rights small:
+
+- Only a tag push triggers it, never a pull request or another workflow, so a fork can't reach
+  the write token.
+- The token is read-only (`contents: read`) except in the `release` job, which gets
+  `contents: write` and runs none of the repository's code: it only downloads the build job's files
+  and calls `gh`.
+- No secret but `GITHUB_TOKEN` is used, and every action is pinned to a commit (the version is in
+  a comment beside it).
+
+The `build` job runs on `windows-latest` and:
+
+- **Checks the tag against `kVersion`.** Tag `vX.YY` needs `kVersion = "rcx X.YY (` in
+  `module/src/module.cpp`; any other tag shape or a mismatch fails the run before the build.
+- **Fetches the two dependencies at pinned commits,** so a moving upstream can't change a release:
+  the OpenVR SDK at `0924064` (tag v2.15.6, only `headers/` and `bin/win64/`, since the samples'
+  paths are too long for Windows) and gmod-module-base at `e0156e5` (the development branch, see
+  Building). The commits are in the workflow's `env`; update them there with the clone commands
+  above.
+- **Builds and checks** with `module/tools/build_module.ps1 -Clean`, no `-Install`, so nothing
+  touches a GMod folder: Release, x64, MSVC through Visual Studio's CMake, then the IK tests, the
+  input-file test and `tools/check_input_files.py`. Any failure stops the release.
+- **Hands on** both DLLs and `.github/release-install.md` as a workflow artifact (kept 7 days).
+
+The `release` job, on `ubuntu-latest`, then:
+
+- **Publishes** `gmcl_rcx_win64.dll` and `openvr_api.dll` as the release for the tag, titled
+  "RCX Alpha X.YY", a pre-release while the version is below 1.0, with the install steps from
+  `.github/release-install.md` followed by GitHub's generated notes. If the release already exists
+  (made by hand, as v0.60 was), it keeps its title and notes, and the two DLLs are uploaded to it,
+  replacing files of the same name.
+
+## Engine features
+
+A component that relies on engine internals (a class layout, the model format the engine loads)
+is an engine feature: a wrong guess is a crash, not an error, so it stays off unless this exact game
+build was tested (`docs/rcx-engine-hooks-design.md` in the gamemode, The safety layer). The first is
+`mesh_combine` (merged meshes), registered since 0.62 and not built yet. At every load the module:
+
+1. **Fingerprints the game DLLs the feature names**, from the files the game loaded them from (never a
+   path from Lua): the PE `TimeDateStamp`, `SizeOfImage` and a SHA-256 of `.text`. The feature is
+   cleared only when every one matches a clearance row compiled into `src/engine/engine_guard.cpp`
+   (`kClearances`); otherwise `rcx.Disabled()` says `unknown game build (...)` with the build key.
+   After a game update, fingerprint the new DLLs, test the feature on the harness, add the rows and
+   ship a new build.
+2. **Reads the launcher's policy file**, `lua/bin/rcx_policy.json` (Lua can't write there):
+   `"disabled"` (feature names, or `all`) and `"revoked"` (build keys) turn features off.
+3. **Checks the crash latch**: a feature arms `rcx_state/armed_<feature>` before it first touches the
+   engine, and the module's clean close removes it. A file left by a crash keeps the feature off
+   until `rcx.engine.ClearLatch(feature)` (the player's options), from the next load.
+
+On top, the player's `rcx_<feature>` convar turns it off as for every component, and any Lua may
+turn one off for the rest of its Lua state (never on). The check runs again at each load, since a
+pinned DLL outlives the Lua state.
+
+| Call | Returns |
+|---|---|
+| `rcx.engine.GetBuilds()` | `{[feature] = {key, cleared, latched, disabled, dlls = {{name, timeDateStamp, sizeOfImage, textHash, error}}}}` |
+| `rcx.engine.Disable(feature, reason)` | true; off for this Lua state. False and a reason for a name that isn't an engine feature |
+| `rcx.engine.ClearLatch(feature)` | true when the latch file is gone (on from the next load); false while the feature is in use |
+
+`module/tests/engine_guard_test.cpp` (`rcx_engine_guard_test.exe`, run by every build where the game
+is installed) maps the game's DLLs without running them and checks the refusals, the clearance, the
+policy file, revocation and the latch; `tests/client/rcx_engine_guard.lua` in the gamemode checks the
+build check and the convar in the game.
 
 ## Version
 
@@ -180,12 +296,17 @@ change after the number.
 | `module/src/core/` | Logging, the feature registry, the module folder and pinning; `lua_util.h`, the Lua boundary (`RCX_FUNCTION`, argument checks) |
 | `module/src/vr/openvr_loader.*` | Loads `openvr_api.dll` from the module's own folder |
 | `module/src/vr/vr_session.*` | The OpenVR session, display, frame wait, poses, events, play area, fade, and keeping the session between Lua states |
-| `module/src/vr/d3d9_bridge.*` | The Direct3D 9 vtable hooks, the eye texture capture, the copies and the submit at Present (DXVK and native paths) |
+| `module/src/vr/d3d9_bridge.*` | The Direct3D 9 vtable hooks, the eye texture capture, the copies and the submit at Present (DXVK and native paths), and the Present observer other components (`rcx.gpu`) use |
 | `module/src/vr/dxvk_interop.h` | DXVK's Direct3D 9 interop interfaces and the few Vulkan types they use (no Vulkan SDK needed) |
 | `module/src/vr/vr_input.*` | Actions, the manifest and default bindings, haptics, the finger curl |
 | `module/src/vr/vr_lua.*` | The `rcx.vr` table and the OpenVR to Source conversions |
 | `module/src/ik/ik_solver.*` | The body IK solver: plain C++, no GMod or OpenVR, so it builds into the unit tests too |
 | `module/src/ik/ik_lua.*` | The `rcx.ik` table: argument checks and results on the stack |
+| `module/src/gpu/gpu_timing.*` | `rcx.gpu`'s timing: the Present observer, the timestamp query ring, the samples and summaries |
+| `module/src/gpu/gpu_lua.*` | The `rcx.gpu` table |
+| `module/src/engine/engine_guard.*` | The engine features' safety layer: DLL fingerprints, the compiled clearances, the policy file, the crash latch |
+| `module/src/engine/engine_lua.*` | The `rcx.engine` table and the engine feature list (`RegisterFeatures`) |
+| `module/tests/engine_guard_test.cpp` | The safety layer's checks against the game's DLLs outside the game (`rcx_engine_guard_test.exe`) |
 | `module/tests/ik_solver_test.cpp` | The solver's unit tests and a timing loop (`rcx_ik_test.exe`) |
 | `module/tests/input_files_test.cpp`, `module/tools/check_input_files.py` | The VR input files written without SteamVR, and their check |
 | `module/build_module.bat`, `module/tools/build_module.ps1`, `module/README.md` | The build, the install with its lock check and rollback copy, and how to run them |
