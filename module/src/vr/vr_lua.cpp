@@ -241,6 +241,16 @@ namespace rcx::vr
 				SetNumber(lua, "maxHeight", display.maxHeight);
 			}
 
+			uint32_t textureWidth = 0;
+			uint32_t textureHeight = 0;
+			rcx::vr::bridge::GetTextureLimit(textureWidth, textureHeight);
+
+			if (textureWidth > 0)
+			{
+				SetNumber(lua, "maxTextureWidth", textureWidth);
+				SetNumber(lua, "maxTextureHeight", textureHeight);
+			}
+
 			SetNumber(lua, "refreshRate", display.refreshRate);
 			PushEye(lua, display.eyes[0]);
 			lua->SetField(-2, "left");

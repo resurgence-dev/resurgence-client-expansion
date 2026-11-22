@@ -86,6 +86,9 @@ namespace rcx::vr::bridge
 	// True once the game's device has presented through the hooks.
 	bool IsDeviceFound();
 
+	// The device's texture size limit (D3DCAPS9 MaxTextureWidth and Height), 0 until the device is found.
+	void GetTextureLimit(uint32_t& width, uint32_t& height);
+
 	// Main thread. The submit path is chosen and built on the device thread at the first submit.
 	bool BeginSession(::vr::IVRSystem* system, ::vr::IVRCompositor* compositor, std::string& reason);
 

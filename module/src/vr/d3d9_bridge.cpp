@@ -1,6 +1,7 @@
 #include "vr/d3d9_bridge.h"
 
 #include <atomic>
+#include <cstdio>
 #include <chrono>
 #include <deque>
 #include <mutex>
@@ -98,6 +99,26 @@ namespace rcx::vr::bridge
 
 		// Shared between the hooks (device thread) and Lua; atomics only.
 		std::atomic<IDirect3DDevice9*> gameDevice{nullptr};
+
+		// The device's texture size limit (D3DCAPS9), read once the game's device is found; 0 until then.
+		std::atomic<uint32_t> maxTextureWidth{0};
+		std::atomic<uint32_t> maxTextureHeight{0};
+
+		// The last render-target texture creation seen while a capture was armed, for EndCapture's reason.
+		struct CreateAttempt
+		{
+			bool seen = false;
+			uint32_t width = 0;
+			uint32_t height = 0;
+			uint32_t actualWidth = 0;
+			uint32_t actualHeight = 0;
+			uint32_t format = 0;
+			long result = 0;
+			int count = 0;
+		};
+
+		std::mutex attemptMutex;
+		CreateAttempt lastAttempt;
 		std::atomic<IDirect3DSurface9*> eyeSurface{nullptr};
 		std::atomic<uint32_t> eyeGeneration{0};
 		std::atomic<bool> eyeDrawn{false};
@@ -734,6 +755,15 @@ namespace rcx::vr::bridge
 			{
 				gameDevice.compare_exchange_strong(known, device);
 				known = gameDevice.load();
+
+				D3DCAPS9 caps{};
+
+				if (known == device && SUCCEEDED(device->GetDeviceCaps(&caps)))
+				{
+					maxTextureWidth = caps.MaxTextureWidth;
+					maxTextureHeight = caps.MaxTextureHeight;
+				}
+
 				rcx::core::Log("vr: found the game's Direct3D 9 device (Present%s, %s thread)", isEx ? "Ex" : "",
 					GetCurrentThreadId() == luaThreadId ? "Lua" : "another");
 			}
@@ -917,6 +947,28 @@ namespace rcx::vr::bridge
 		{
 			HRESULT result = originalCreateTexture(device, width, height, levels, usage, format, pool, texture, sharedHandle);
 
+			if (!insideBridge && (usage & D3DUSAGE_RENDERTARGET) != 0 && (captureArmed.load() || recaptureArmed.load()))
+			{
+				CreateAttempt attempt{};
+				attempt.seen = true;
+				attempt.width = width;
+				attempt.height = height;
+				attempt.format = static_cast<uint32_t>(format);
+				attempt.result = static_cast<long>(result);
+
+				D3DSURFACE_DESC desc{};
+
+				if (SUCCEEDED(result) && texture != nullptr && *texture != nullptr && SUCCEEDED((*texture)->GetLevelDesc(0, &desc)))
+				{
+					attempt.actualWidth = desc.Width;
+					attempt.actualHeight = desc.Height;
+				}
+
+				std::lock_guard<std::mutex> lock(attemptMutex);
+				attempt.count = lastAttempt.count + 1;
+				lastAttempt = attempt;
+			}
+
 			if (FAILED(result) || insideBridge || texture == nullptr || *texture == nullptr)
 			{
 				return result;
@@ -1064,6 +1116,12 @@ namespace rcx::vr::bridge
 		presentObserver.store(observer);
 	}
 
+	void GetTextureLimit(uint32_t& width, uint32_t& height)
+	{
+		width = maxTextureWidth.load();
+		height = maxTextureHeight.load();
+	}
+
 	bool IsDeviceFound()
 	{
 		return gameDevice.load() != nullptr;
@@ -1123,6 +1181,11 @@ namespace rcx::vr::bridge
 
 	void BeginCapture(uint32_t width, uint32_t height)
 	{
+		{
+			std::lock_guard<std::mutex> lock(attemptMutex);
+			lastAttempt = CreateAttempt{};
+		}
+
 		captureWidth = width;
 		captureHeight = height;
 		recaptureArmed = false;
@@ -1145,7 +1208,34 @@ namespace rcx::vr::bridge
 
 		if (eyeTexture == nullptr || eyeSurface.load() == nullptr)
 		{
-			reason = "no render target texture of that size was created between BeginTarget and EndTarget (a target that already existed isn't created again: use a new name)";
+			CreateAttempt attempt{};
+
+			{
+				std::lock_guard<std::mutex> attemptLock(attemptMutex);
+				attempt = lastAttempt;
+			}
+
+			char detail[320]{};
+
+			if (!attempt.seen)
+			{
+				std::snprintf(detail, sizeof(detail), "no render target was created at all while capturing (a target that already existed isn't created again: use a new name)");
+			}
+			else if (attempt.result < 0)
+			{
+				std::snprintf(detail, sizeof(detail), "Direct3D refused the render target: %ux%u format %u failed with HRESULT 0x%08lx", attempt.width, attempt.height,
+					attempt.format, static_cast<unsigned long>(attempt.result));
+			}
+			else
+			{
+				std::snprintf(detail, sizeof(detail), "the last render target made was %ux%u (asked %ux%u) format %u, not the eye size", attempt.actualWidth,
+					attempt.actualHeight, attempt.width, attempt.height, attempt.format);
+			}
+
+			char limit[96]{};
+			std::snprintf(limit, sizeof(limit), "; the device's texture limit is %ux%u", maxTextureWidth.load(), maxTextureHeight.load());
+			reason = "no eye texture of " + std::to_string(width) + "x" + std::to_string(height) + " was captured: " + detail +
+				(maxTextureWidth.load() > 0 ? limit : "");
 			return false;
 		}
 
