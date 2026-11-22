@@ -25,6 +25,8 @@ namespace rcx::core
 
 	void RegisterFeature(const char* name);
 	void DisableFeature(const char* name, const std::string& reason);
+	// Clears a feature's disabled reason, for a check that runs again at every load (the DLL can outlive a Lua state).
+	void ResetFeature(const char* name);
 	bool IsFeatureDisabled(const char* name, std::string* reason = nullptr);
 	std::vector<FeatureState> GetFeatures();
 

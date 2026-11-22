@@ -5,6 +5,8 @@
 
 #include "openvr.h"
 
+struct IDirect3DDevice9;
+
 /*
 	The bridge between the game's Direct3D 9 device and the compositor.
 
@@ -62,8 +64,27 @@ namespace rcx::vr::bridge
 	};
 
 	// Main thread. Installs the hooks once per process; they stay for the process's life and do
-	// nothing while no session runs.
+	// nothing while no session runs. Other components (rcx.gpu) install them too.
 	bool InstallHooks(std::string& reason);
+
+	/*
+		Another component's view of the game's Present and Reset, called on the presenting thread
+		(the render thread with mat_queue_mode 2) with the game's own device: beforePresent just before
+		the real Present, afterPresent right after it returns, onReset before a Reset. The functions
+		must stay valid for the process's life (the module is pinned once the hooks are in); pass
+		nullptr to stop the calls.
+	*/
+	struct PresentObserver
+	{
+		void (*beforePresent)(IDirect3DDevice9* device) = nullptr;
+		void (*afterPresent)(IDirect3DDevice9* device) = nullptr;
+		void (*onReset)(IDirect3DDevice9* device) = nullptr;
+	};
+
+	void SetPresentObserver(const PresentObserver* observer);
+
+	// True once the game's device has presented through the hooks.
+	bool IsDeviceFound();
 
 	// Main thread. The submit path is chosen and built on the device thread at the first submit.
 	bool BeginSession(::vr::IVRSystem* system, ::vr::IVRCompositor* compositor, std::string& reason);

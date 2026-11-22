@@ -33,6 +33,13 @@ add_library(gmcl_rcx SHARED
 	src/vr/vr_lua.cpp
 	src/ik/ik_solver.cpp
 	src/ik/ik_lua.cpp
+	src/gpu/gpu_timing.cpp
+	src/gpu/gpu_lua.cpp
+	src/engine/engine_guard.cpp
+	src/engine/engine_lua.cpp
+	src/mesh/mesh_merge.cpp
+	src/mesh/mesh_worker.cpp
+	src/mesh/mesh_lua.cpp
 )
 target_include_directories(gmcl_rcx PRIVATE
 	src
@@ -69,3 +76,19 @@ set_target_properties(rcx_input_files_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "
 add_custom_command(TARGET gmcl_rcx POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${RCX_OPENVR_DIR}/bin/win64/openvr_api.dll" "${RCX_OUTPUT_DIR}/openvr_api.dll"
 )
+
+# The engine safety layer's build check, policy file and crash latch outside the game (tests/engine_guard_test.cpp).
+add_executable(rcx_engine_guard_test tests/engine_guard_test.cpp src/engine/engine_guard.cpp src/core/core.cpp)
+target_include_directories(rcx_engine_guard_test PRIVATE src)
+target_compile_definitions(rcx_engine_guard_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE)
+target_compile_options(rcx_engine_guard_test PRIVATE /W4 /EHsc /permissive-)
+set_property(TARGET rcx_engine_guard_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_target_properties(rcx_engine_guard_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${RCX_OUTPUT_DIR}/tests/$<0:>")
+
+# The merged-mesh builder against the Python prototype's output (tests/mesh_merge_test.cpp, fixtures from tools/mesh_prototype).
+add_executable(rcx_mesh_merge_test tests/mesh_merge_test.cpp src/mesh/mesh_merge.cpp)
+target_include_directories(rcx_mesh_merge_test PRIVATE src)
+target_compile_definitions(rcx_mesh_merge_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_compile_options(rcx_mesh_merge_test PRIVATE /W4 /EHsc /permissive-)
+set_property(TARGET rcx_mesh_merge_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_target_properties(rcx_mesh_merge_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${RCX_OUTPUT_DIR}/tests/$<0:>")

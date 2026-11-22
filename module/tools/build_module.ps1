@@ -163,6 +163,29 @@ if (Test-Path $inputTest) {
 	}
 }
 
+# The engine safety layer against this machine's game DLLs (skipped where there is no game, as on CI); a failure fails the build.
+$guardTest = Join-Path $testsDir "rcx_engine_guard_test.exe"
+$gameBin = [System.IO.Path]::GetFullPath((Join-Path $moduleDir "..\..\..\..\bin\win64"))
+if ((Test-Path $guardTest) -and (Test-Path (Join-Path $gameBin "engine.dll"))) {
+	& $guardTest $gameBin
+	if ($LASTEXITCODE -ne 0) {
+		Write-Host "FAILED: rcx_engine_guard_test" -ForegroundColor Red
+		exit 1
+	}
+}
+
+# The merged-mesh builder against the Python prototype's output, when the fixtures were written on this machine
+# (tools/mesh_prototype/merge_cases.py --bake --fixtures builds/win64/tests/mesh_fixtures); a failure fails the build.
+$meshTest = Join-Path $testsDir "rcx_mesh_merge_test.exe"
+$meshFixtures = Join-Path $testsDir "mesh_fixtures"
+if ((Test-Path $meshTest) -and (Test-Path $meshFixtures)) {
+	& $meshTest $meshFixtures
+	if ($LASTEXITCODE -ne 0) {
+		Write-Host "FAILED: rcx_mesh_merge_test" -ForegroundColor Red
+		exit 1
+	}
+}
+
 if ($Install) {
 	Write-Host "== Install into $luaBin" -ForegroundColor Cyan
 	if (-not (Test-CanReplace)) { exit 1 }

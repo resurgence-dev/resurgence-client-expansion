@@ -211,16 +211,60 @@ build or a [release](https://github.com/resurgence-dev/resurgence-client-expansi
 
 ## Releases
 
-`.github/workflows/release.yml` builds and publishes a release when a `v*` tag is pushed. To cut one:
+Releases are made by hand with `scripts/release.ps1`, which runs every step and stops at the first
+one that fails:
 
-1. Bump `kVersion` in `module/src/module.cpp` and commit.
-2. Tag that commit with the same number and push the tag: `git tag -a v0.61 -m "rcx 0.61"`, then
-   `git push origin v0.61`.
+```powershell
+./scripts/release.ps1
+```
+
+`-DryRun` does the checks and the build and shows the plan, and changes nothing in git or on
+GitHub. `-Clean` builds from an empty CMake tree. It works from any folder, under PowerShell 7 and
+Windows PowerShell 5. It needs the GitHub CLI, set up once: `winget install GitHub.cli`, then
+`gh auth login` in a new terminal. `gh` keeps the sign-in itself; the script never sees a token.
+
+1. **Checks** a branch is checked out and not behind `origin`, `gh` is installed and signed in, and
+   no workflow in `.github/workflows` starts on a tag push (The release workflow, below).
+2. **Shows** `kVersion`, the newest `vX.YY` tag, the branch and the uncommitted files, then **asks**
+   for the version and a commit message. Enter takes the version `module.cpp` already has when it is
+   newer than the newest tag, the usual case since `kVersion` is bumped as the module changes. A
+   version that isn't newer than the newest tag, is older than `kVersion` or whose tag exists is
+   refused.
+3. **Writes** the version into `kVersion` in `module/src/module.cpp` when it differs. That is the
+   only place the addon holds it.
+4. **Builds** with `module/tools/build_module.ps1`, without `-Install`, so `garrysmod/lua/bin` is
+   never touched and a running game doesn't matter. The build's own tests run as always.
+5. **Checks the built DLL** reports the version (the first `rcx X.YY (` in the file), the check the
+   launcher's `publish-manifest.ps1` makes on a release.
+6. **Shows the plan**: the files to commit, the branch, the tag, and both DLLs with size and
+   SHA-256, then asks one y/n. On `n` or `-DryRun`, `module.cpp` is put back as it was.
+7. **Commits** everything in the working tree (`git add -A`), **pushes** the branch, creates the
+   annotated tag `vX.YY` with the message `rcx X.YY` and pushes it.
+8. **Creates the release** with `gh release create`: both DLLs from `module/builds/win64`, titled
+   "RCX Alpha X.YY", a pre-release while the version is below 1.0, with the install steps from
+   `.github/release-install.md` and GitHub's generated notes. It then reads the release back and
+   compares each file's size and SHA-256 with the build.
+9. **Offers** to run the launcher's `scripts/publish-manifest.ps1 -RcxTag vX.YY` (`-LauncherRepo`
+   names the launcher's folder, default `C:\Users\bizzc\source\repos\resurgence-launcher`). Players
+   get the build only once the manifest is published.
+
+If a step after the y/n fails, the script says which steps were done; finish the rest by hand.
+
+### The release workflow
+
+`.github/workflows/release.yml` builds and publishes a release on GitHub. It is not the release
+path: it starts only by hand (`workflow_dispatch`), never on a tag push, because a second build
+uploaded over the script's files would change the hashes the launcher's manifest holds. The script
+refuses to release while any workflow there starts on a tag push. A manual run is for a tag that
+has no release yet (a cloud build instead of a local one): on GitHub, Actions, release, Run
+workflow, and pick the `vX.YY` tag as the ref. A run on a branch fails the tag check, and a run on
+a tag whose release exists fails without touching its files. GitHub offers the Run workflow button
+only once the workflow file is on the default branch, `master`.
 
 The repository is public, so the workflow keeps the token's rights small:
 
-- Only a tag push triggers it, never a pull request or another workflow, so a fork can't reach
-  the write token.
+- Only a manual run by someone with write access starts it, never a push, a pull request or
+  another workflow, so a fork can't reach the write token.
 - The token is read-only (`contents: read`) except in the `release` job, which gets
   `contents: write` and runs none of the repository's code: it only downloads the build job's files
   and calls `gh`.
@@ -246,8 +290,7 @@ The `release` job, on `ubuntu-latest`, then:
 - **Publishes** `gmcl_rcx_win64.dll` and `openvr_api.dll` as the release for the tag, titled
   "RCX Alpha X.YY", a pre-release while the version is below 1.0, with the install steps from
   `.github/release-install.md` followed by GitHub's generated notes. If the release already exists
-  (made by hand, as v0.60 was), it keeps its title and notes, and the two DLLs are uploaded to it,
-  replacing files of the same name.
+  (made by the script, or by hand as v0.60 was), the job fails and leaves it as it is.
 
 ## Engine features
 
@@ -283,6 +326,29 @@ is installed) maps the game's DLLs without running them and checks the refusals,
 policy file, revocation and the latch; `tests/client/rcx_engine_guard.lua` in the gamemode checks the
 build check and the convar in the game.
 
+## Merged meshes
+
+`rcx.mesh` (since 0.63) builds `mesh_combine`'s merged models: one real model per character outfit, from the part
+models' bytes, written by a worker thread into the fixed folder `garrysmod/models/rcx_merged/<name>` (`.mdl`, `.vvd`,
+`.dx90.vtx`, each through a temporary name, the `.mdl` last). The gamemode's `cl_mergedparts.lua` decides what merges
+and draws the result (gamemode `docs/mesh-combine-design.md`). Needs `mesh_combine` on (Engine features); the first
+`Build` of a session arms its crash latch and prunes the folder to 512 MB.
+
+| Call | Returns |
+|---|---|
+| `rcx.mesh.Build(job)` | a build id, or false and a reason. `job = {name = 32 hex digits, body = body .mdl bytes, parts = {{mdl, vvd, vtx = bytes, skin, material, materials = {...}, bodygroups = {[name] = n}, positioned, bone, attachment, pos = {x, y, z}, ang = {p, y, r}, scale}, ...}, bake = {[bone] = ancestor}}` |
+| `rcx.mesh.Poll()` | finished builds: `{{id, ok, ms, path, bones, baked, rebinds, meshes, vertices}` or `{id, ok = false, ms, error}}` |
+| `rcx.mesh.Cancel(id)` | true when a queued or running build was dropped |
+| `rcx.mesh.Exists(name)` | whether the three files are already in the folder (an earlier session's) |
+| `rcx.mesh.Stats()` | `{queued, building, done, failed, canceled}` |
+
+The builder (`src/mesh/mesh_merge.cpp`) is a port of the Python prototype in `module/tools/mesh_prototype/`
+(`merge.py`, with `bake_plan.py` and `merge_cases.py`), kept byte-identical to it: `merge_cases.py --bake --fixtures
+builds/win64/tests/mesh_fixtures` writes real cases' inputs and outputs, and `rcx_mesh_merge_test.exe` (run by every
+build where the fixtures exist) compares, then checks refusals of hostile input. One merged bone per name and bind
+pose: a part keeps its own bind, a baked bone becomes its live ancestor with the bind that reproduces it, and same-named
+bones are all driven by bonemerge; no skinned vertex moves. A positioned part's vertices move onto its one bone.
+
 ## Version
 
 `kVersion` in `module/src/module.cpp`. Bump it on every build that changes behavior, and name the
@@ -306,10 +372,15 @@ change after the number.
 | `module/src/gpu/gpu_lua.*` | The `rcx.gpu` table |
 | `module/src/engine/engine_guard.*` | The engine features' safety layer: DLL fingerprints, the compiled clearances, the policy file, the crash latch |
 | `module/src/engine/engine_lua.*` | The `rcx.engine` table and the engine feature list (`RegisterFeatures`) |
+| `module/src/mesh/mesh_merge.*` | The merged-mesh builder: parse, bone union and bake, positioned parts, strips, the studio header |
+| `module/src/mesh/mesh_worker.*` | The build queue, its worker thread and the file writes into `models/rcx_merged/` |
+| `module/src/mesh/mesh_lua.*` | The `rcx.mesh` table |
+| `module/tests/mesh_merge_test.cpp`, `module/tools/mesh_prototype/` | The golden test against the Python prototype, and the prototype |
 | `module/tests/engine_guard_test.cpp` | The safety layer's checks against the game's DLLs outside the game (`rcx_engine_guard_test.exe`) |
 | `module/tests/ik_solver_test.cpp` | The solver's unit tests and a timing loop (`rcx_ik_test.exe`) |
 | `module/tests/input_files_test.cpp`, `module/tools/check_input_files.py` | The VR input files written without SteamVR, and their check |
 | `module/build_module.bat`, `module/tools/build_module.ps1`, `module/README.md` | The build, the install with its lock check and rollback copy, and how to run them |
+| `scripts/release.ps1` | The release script (Releases) |
 | `lua/autorun/client/rcx_testbed.lua` | The testbed |
 
 ## Acknowledgment

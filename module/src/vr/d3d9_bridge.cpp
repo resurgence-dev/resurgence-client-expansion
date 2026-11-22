@@ -94,6 +94,7 @@ namespace rcx::vr::bridge
 
 		bool hooksInstalled = false;
 		DWORD luaThreadId = 0;
+		std::atomic<const PresentObserver*> presentObserver{nullptr};
 
 		// Shared between the hooks (device thread) and Lua; atomics only.
 		std::atomic<IDirect3DDevice9*> gameDevice{nullptr};
@@ -824,27 +825,80 @@ namespace rcx::vr::bridge
 			rcx::core::Log("vr: device reset; the eye texture will be captured again");
 		}
 
+		// The observer only sees the game's own device, never a Present the bridge makes itself.
+		const PresentObserver* ObserverFor(IDirect3DDevice9* device)
+		{
+			if (insideBridge || device == nullptr || device != gameDevice.load())
+			{
+				return nullptr;
+			}
+
+			return presentObserver.load();
+		}
+
 		HRESULT STDMETHODCALLTYPE HookPresent(IDirect3DDevice9* device, const RECT* sourceRect, const RECT* destinationRect, HWND window, const RGNDATA* dirtyRegion)
 		{
 			OnPresent(device, false);
-			return originalPresent(device, sourceRect, destinationRect, window, dirtyRegion);
+			const PresentObserver* observer = ObserverFor(device);
+
+			if (observer != nullptr)
+			{
+				observer->beforePresent(device);
+			}
+
+			HRESULT result = originalPresent(device, sourceRect, destinationRect, window, dirtyRegion);
+
+			if (observer != nullptr)
+			{
+				observer->afterPresent(device);
+			}
+
+			return result;
 		}
 
 		HRESULT STDMETHODCALLTYPE HookPresentEx(IDirect3DDevice9Ex* device, const RECT* sourceRect, const RECT* destinationRect, HWND window, const RGNDATA* dirtyRegion, DWORD flags)
 		{
 			OnPresent(device, true);
-			return originalPresentEx(device, sourceRect, destinationRect, window, dirtyRegion, flags);
+			const PresentObserver* observer = ObserverFor(device);
+
+			if (observer != nullptr)
+			{
+				observer->beforePresent(device);
+			}
+
+			HRESULT result = originalPresentEx(device, sourceRect, destinationRect, window, dirtyRegion, flags);
+
+			if (observer != nullptr)
+			{
+				observer->afterPresent(device);
+			}
+
+			return result;
 		}
 
 		HRESULT STDMETHODCALLTYPE HookReset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* parameters)
 		{
 			OnReset(device);
+			const PresentObserver* observer = ObserverFor(device);
+
+			if (observer != nullptr)
+			{
+				observer->onReset(device);
+			}
+
 			return originalReset(device, parameters);
 		}
 
 		HRESULT STDMETHODCALLTYPE HookResetEx(IDirect3DDevice9Ex* device, D3DPRESENT_PARAMETERS* parameters, D3DDISPLAYMODEEX* displayMode)
 		{
 			OnReset(device);
+			const PresentObserver* observer = ObserverFor(device);
+
+			if (observer != nullptr)
+			{
+				observer->onReset(device);
+			}
+
 			return originalResetEx(device, parameters, displayMode);
 		}
 
@@ -1003,6 +1057,16 @@ namespace rcx::vr::bridge
 		hooksInstalled = true;
 		rcx::core::Log("vr: Direct3D 9 hooks installed");
 		return true;
+	}
+
+	void SetPresentObserver(const PresentObserver* observer)
+	{
+		presentObserver.store(observer);
+	}
+
+	bool IsDeviceFound()
+	{
+		return gameDevice.load() != nullptr;
 	}
 
 	bool BeginSession(::vr::IVRSystem* system, ::vr::IVRCompositor* newCompositor, std::string& reason)

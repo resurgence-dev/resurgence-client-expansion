@@ -93,6 +93,17 @@ namespace rcx::core
 		}
 	}
 
+	void ResetFeature(const char* name)
+	{
+		std::lock_guard<std::mutex> lock(featureMutex);
+		FeatureState* feature = FindFeature(name);
+
+		if (feature != nullptr)
+		{
+			feature->disabledReason.clear();
+		}
+	}
+
 	bool IsFeatureDisabled(const char* name, std::string* reason)
 	{
 		std::lock_guard<std::mutex> lock(featureMutex);

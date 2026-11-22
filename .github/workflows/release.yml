@@ -1,16 +1,17 @@
-# Builds the module for a pushed v* tag, runs its checks and publishes the two DLLs as the tag's
-# GitHub release. How to cut a release: README.md, Releases.
+# Builds the module for a v* tag, runs its checks and publishes the two DLLs as the tag's GitHub
+# release. How to cut a release: README.md, Releases.
 #
-# The repository is public, so: only a tag push triggers this (never a pull request or another
+# The repository is public, so: only a manual run triggers this (never a pull request or another
 # workflow, so a fork can't reach the write token), the token is read-only except in the release
 # job, which runs none of the repository's code, no secret but GITHUB_TOKEN is used, and every
 # action is pinned to a commit.
 name: release
 
+# Releases are cut locally by scripts/release.ps1, which uploads its own build and publishes the
+# launcher's manifest with those files' hashes, so a tag push must not upload a second build over
+# them. Run this by hand, choosing a v* tag as the ref, for a cloud build when one is wanted.
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -137,12 +138,11 @@ jobs:
           $files = "release/gmcl_rcx_win64.dll", "release/openvr_api.dll"
           gh release view $env:TAG *> $null
           if ($LASTEXITCODE -eq 0) {
-            # made by hand (as v0.60 was): keep its title and notes, attach or replace the DLLs
-            Write-Host "release $env:TAG exists, uploading the files to it"
-            gh release upload $env:TAG @files --clobber
-          } else {
-            $flags = @()
-            if ($env:PRERELEASE -eq "true") { $flags += "--prerelease" }
-            gh release create $env:TAG @files --verify-tag --title "RCX Alpha $env:VERSION" --notes-file release/release-install.md --generate-notes @flags
+            # its files' hashes may be in the launcher's manifest, so they are never replaced
+            Write-Host "::error::release $env:TAG already exists; its files are left as they are"
+            exit 1
           }
+          $flags = @()
+          if ($env:PRERELEASE -eq "true") { $flags += "--prerelease" }
+          gh release create $env:TAG @files --verify-tag --title "RCX Alpha $env:VERSION" --notes-file release/release-install.md --generate-notes @flags
           if ($LASTEXITCODE -ne 0) { exit 1 }
