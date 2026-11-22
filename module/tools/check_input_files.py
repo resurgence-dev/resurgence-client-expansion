@@ -7,7 +7,9 @@ right B button) land in different sets. Press types (single, double, long, held)
 Touch, W8's layout has its presses (menu and weapon_menu on left A, ui_toggle and
 quick_select_right on right B, reload, ammo_next and quick_select_weapon on right B in the weapon set). Chords point only at
 declared actions with two inputs, and on the Index and Touch tuning_menu is the chord of both
-thumbstick clicks. Run by tools/build_module.ps1 after the exe.
+thumbstick clicks. The headsets with eye tracking (Steam Frame, Quest over Steam Link, other Steam
+Link headsets) get bindings holding only the eye gaze, an eyetracking action on
+/user/head/eyetracking. Run by tools/build_module.ps1 after the exe.
 """
 import json
 import os
@@ -32,7 +34,9 @@ for path in actions | sets:
 if names.get("/actions/main/in/pipboy") != "Open Pip-Boy":
     failures.append("pipboy's display name is " + repr(names.get("/actions/main/in/pipboy")))
 
-expected = {"knuckles", "oculus_touch", "vive_controller", "holographic_controller"}
+controllers = {"knuckles", "oculus_touch", "vive_controller", "holographic_controller"}
+headsets = {"frame_hmd", "rift", "remote_hmd"}
+expected = controllers | headsets
 listed = {entry["controller_type"] for entry in manifest["default_bindings"]}
 
 if listed != expected:
@@ -84,11 +88,19 @@ for entry in manifest["default_bindings"]:
             if len(chord.get("inputs", [])) != 2 or any(len(pair) != 2 for pair in chord["inputs"]):
                 failures.append(entry["controller_type"] + ": chord " + chord["output"] + " needs two [path, component] inputs")
 
-        for item in set_bindings.get("skeleton", []) + set_bindings.get("haptics", []):
+        for item in set_bindings.get("skeleton", []) + set_bindings.get("haptics", []) + set_bindings.get("eyetracking", []):
             if item["output"] not in actions:
                 failures.append(entry["controller_type"] + ": output " + item["output"] + " isn't declared")
 
     outputs = json.dumps(bindings)
+
+    if entry["controller_type"] in headsets:
+        gaze = bindings["bindings"].get("/actions/rcx", {}).get("eyetracking", [])
+
+        if gaze != [{"output": "/actions/rcx/in/eye_gaze", "path": "/user/head/eyetracking"}]:
+            failures.append(entry["controller_type"] + ": the eye gaze binding is " + json.dumps(gaze))
+
+        continue
 
     if entry["controller_type"] in ("knuckles", "oculus_touch"):
         wanted = {
@@ -128,6 +140,11 @@ application = app["applications"][0]
 
 if application["app_key"] != "gmod.resurgence.rcx" or not application["action_manifest_path"].endswith("actions.json"):
     failures.append("application manifest: " + json.dumps(application))
+
+types = {action["name"]: action["type"] for action in manifest["actions"]}
+
+if types.get("/actions/rcx/in/eye_gaze") != "eyetracking":
+    failures.append("eye_gaze is a " + repr(types.get("/actions/rcx/in/eye_gaze")) + " action, not eyetracking")
 
 for failure in failures:
     print("FAIL " + failure)

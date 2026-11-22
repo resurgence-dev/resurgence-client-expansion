@@ -45,6 +45,8 @@ namespace
 		{"quick_select_weapon", "boolean", "right_b_long", "Favorites, weapon hand", "weapon"},
 		{"click_left", "boolean", "left_trigger", "Left click", "pointer"},
 		{"click_right", "boolean", "right_trigger", "Right click", "pointer"},
+		{"pipboy_drop", "boolean", "right_b", "Pip-Boy: drop the item", "pipboy"},
+		{"pipboy_save", "boolean", "right_a", "Pip-Boy: save the item", "pipboy"},
 	};
 }
 

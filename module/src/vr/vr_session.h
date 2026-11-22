@@ -73,6 +73,29 @@ namespace rcx::vr
 
 	bool Submit(uint32_t frameId, std::string& reason);
 
+	struct ControllerInfo
+	{
+		// A controller holds the hand's role.
+		bool connected = false;
+
+		// Prop_ControllerType_String ("knuckles", "oculus_touch", ...) and Prop_RenderModelName_String;
+		// empty when the driver doesn't say.
+		std::string controllerType;
+		std::string renderModel;
+
+		// The render model's "tip" component, SteamVR's pointing pose (what /pose/tip is bound to), as
+		// the transform from the tip's space to the controller's tracked space, -Z out of the tip.
+		// False when the model has none.
+		bool tipValid = false;
+		::vr::HmdMatrix34_t tip{};
+	};
+
+	// The controller in a hand's role (Device::LeftHand or Device::RightHand). Read from the runtime
+	// when the role's device changes or an event says the controller did (activated, updated,
+	// deactivated, a role or its model or type property changed) and kept until then. A tip the
+	// runtime can't give yet is asked for again at most once a second.
+	bool GetControllerInfo(Device hand, ControllerInfo& info, std::string& reason);
+
 	struct PlayArea
 	{
 		float width = 0.0f;

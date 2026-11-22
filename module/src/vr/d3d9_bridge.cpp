@@ -217,7 +217,7 @@ namespace rcx::vr::bridge
 			SafeRelease(compositorDevice);
 		}
 
-		// deviceMutex held, device thread.
+		// deviceMutex held, device thread. The interop device goes with the copies, so the backend is chosen again.
 		void ReleaseDeviceResources()
 		{
 			for (CopyTexture& copy : copies)
@@ -231,6 +231,11 @@ namespace rcx::vr::bridge
 
 			SafeRelease(drawQuery);
 			SafeRelease(interopDevice);
+
+			if (backend != Backend::Failed)
+			{
+				backend = Backend::Unknown;
+			}
 		}
 
 		bool PatchSlot(void** vtable, int index, void* hook, void** original)
@@ -553,6 +558,13 @@ namespace rcx::vr::bridge
 		{
 			dxvk::VkImage image = nullptr;
 			dxvk::VkImageLayout layout = dxvk::VK_IMAGE_LAYOUT_MAX_ENUM;
+
+			if (interopDevice == nullptr || copy.interopTexture == nullptr || copy.surface == nullptr)
+			{
+				stats.submitErrors++;
+				SetError("the DXVK interop objects are gone");
+				return;
+			}
 
 			if (FAILED(copy.interopTexture->GetVulkanImageInfo(&image, &layout, nullptr)) || image == nullptr)
 			{

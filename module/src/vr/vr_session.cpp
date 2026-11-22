@@ -1,5 +1,6 @@
 #include "vr/vr_session.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -41,6 +42,32 @@ namespace rcx::vr
 		FrameRecord frames[kFrameHistory]{};
 		DevicePose latestPoses[static_cast<int>(Device::Count)]{};
 
+		constexpr double kTipRetrySeconds = 1.0;
+		constexpr uint32_t kMaxPropertyLength = 1024;
+		constexpr float kMaxTipDistance = 0.5f;
+
+		::vr::IVRRenderModels* vrRenderModels = nullptr;
+		::vr::IVRInput* vrInputPaths = nullptr;
+
+		struct ControllerCache
+		{
+			bool known = false;
+			::vr::TrackedDeviceIndex_t deviceIndex = ::vr::k_unTrackedDeviceIndexInvalid;
+			ControllerInfo info{};
+			std::chrono::steady_clock::time_point nextTipTry{};
+		};
+
+		// left, right
+		ControllerCache controllers[2]{};
+
+		void ForgetControllers()
+		{
+			for (ControllerCache& cache : controllers)
+			{
+				cache = ControllerCache{};
+			}
+		}
+
 		bool IsOff(std::string& reason)
 		{
 			return rcx::core::IsFeatureDisabled(kFeature, &reason);
@@ -53,6 +80,9 @@ namespace rcx::vr
 			vrCompositor = nullptr;
 			vrChaperone = nullptr;
 			vrOverlay = nullptr;
+			vrRenderModels = nullptr;
+			vrInputPaths = nullptr;
+			ForgetControllers();
 			keyboardOpen = false;
 
 			if (api != nullptr)
@@ -133,7 +163,19 @@ namespace rcx::vr
 					QueueEvent("play_area_changed", 0.0f);
 					break;
 				case ::vr::VREvent_TrackedDeviceRoleChanged:
+					ForgetControllers();
 					QueueEvent("controllers_changed", 0.0f);
+					break;
+				case ::vr::VREvent_TrackedDeviceActivated:
+				case ::vr::VREvent_TrackedDeviceUpdated:
+					ForgetControllers();
+					break;
+				case ::vr::VREvent_PropertyChanged:
+					if (event.data.property.prop == ::vr::Prop_RenderModelName_String || event.data.property.prop == ::vr::Prop_ControllerType_String)
+					{
+						ForgetControllers();
+					}
+
 					break;
 				case ::vr::VREvent_InputFocusChanged:
 					QueueEvent("input_focus_changed", 0.0f);
@@ -162,6 +204,8 @@ namespace rcx::vr
 
 					break;
 				case ::vr::VREvent_TrackedDeviceDeactivated:
+					ForgetControllers();
+
 					if (event.trackedDeviceIndex == ::vr::k_unTrackedDeviceIndex_Hmd)
 					{
 						QueueEvent("headset_disconnected", 0.0f);
@@ -191,6 +235,117 @@ namespace rcx::vr
 			pose.velocity = source.vVelocity;
 			pose.angularVelocity = source.vAngularVelocity;
 			return pose;
+		}
+
+		// A device's string property, or empty when it's missing or longer than kMaxPropertyLength.
+		std::string ReadStringProperty(::vr::TrackedDeviceIndex_t index, ::vr::ETrackedDeviceProperty property)
+		{
+			::vr::ETrackedPropertyError error = ::vr::TrackedProp_Success;
+			uint32_t size = vrSystem->GetStringTrackedDeviceProperty(index, property, nullptr, 0, &error);
+
+			if (size == 0 || size > kMaxPropertyLength)
+			{
+				return std::string();
+			}
+
+			std::vector<char> buffer(size);
+			vrSystem->GetStringTrackedDeviceProperty(index, property, buffer.data(), size, &error);
+
+			if (error != ::vr::TrackedProp_Success)
+			{
+				return std::string();
+			}
+
+			buffer.back() = '\0';
+			return std::string(buffer.data());
+		}
+
+		// Whether a tip transform is one to trust: finite, and its origin within kMaxTipDistance of the controller.
+		bool IsSaneTip(const ::vr::HmdMatrix34_t& tip)
+		{
+			for (int row = 0; row < 3; row++)
+			{
+				for (int column = 0; column < 4; column++)
+				{
+					if (!std::isfinite(tip.m[row][column]))
+					{
+						return false;
+					}
+				}
+			}
+
+			float x = tip.m[0][3];
+			float y = tip.m[1][3];
+			float z = tip.m[2][3];
+			return x * x + y * y + z * z <= kMaxTipDistance * kMaxTipDistance;
+		}
+
+		// The render model's "tip" component for a hand, through its input path when the input
+		// interface has one, else the older call that takes a controller state (a tip doesn't move
+		// with buttons, so an empty state does).
+		bool ReadTip(Device hand, const std::string& renderModel, ::vr::HmdMatrix34_t& tip)
+		{
+			if (vrRenderModels == nullptr || renderModel.empty())
+			{
+				return false;
+			}
+
+			::vr::RenderModel_ControllerMode_State_t mode{};
+			::vr::RenderModel_ComponentState_t state{};
+			::vr::VRInputValueHandle_t devicePath = ::vr::k_ulInvalidInputValueHandle;
+			bool found = false;
+
+			if (vrInputPaths != nullptr)
+			{
+				vrInputPaths->GetInputSourceHandle(hand == Device::LeftHand ? "/user/hand/left" : "/user/hand/right", &devicePath);
+			}
+
+			if (devicePath != ::vr::k_ulInvalidInputValueHandle)
+			{
+				found = vrRenderModels->GetComponentStateForDevicePath(renderModel.c_str(), "tip", devicePath, &mode, &state);
+			}
+			else
+			{
+				::vr::VRControllerState_t controllerState{};
+				found = vrRenderModels->GetComponentState(renderModel.c_str(), "tip", &controllerState, &mode, &state);
+			}
+
+			if (!found || !IsSaneTip(state.mTrackingToComponentLocal))
+			{
+				return false;
+			}
+
+			tip = state.mTrackingToComponentLocal;
+			return true;
+		}
+
+		void TryTip(Device hand, ControllerCache& cache)
+		{
+			ControllerInfo& info = cache.info;
+			info.tipValid = ReadTip(hand, info.renderModel, info.tip);
+
+			if (!info.tipValid)
+			{
+				cache.nextTipTry = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(kTipRetrySeconds));
+			}
+		}
+
+		void RefreshController(Device hand, ControllerCache& cache, ::vr::TrackedDeviceIndex_t deviceIndex)
+		{
+			cache = ControllerCache{};
+			cache.known = true;
+			cache.deviceIndex = deviceIndex;
+
+			if (deviceIndex >= ::vr::k_unMaxTrackedDeviceCount || !vrSystem->IsTrackedDeviceConnected(deviceIndex))
+			{
+				return;
+			}
+
+			ControllerInfo& info = cache.info;
+			info.connected = true;
+			info.controllerType = ReadStringProperty(deviceIndex, ::vr::Prop_ControllerType_String);
+			info.renderModel = ReadStringProperty(deviceIndex, ::vr::Prop_RenderModelName_String);
+			TryTip(hand, cache);
 		}
 	}
 
@@ -325,6 +480,18 @@ namespace rcx::vr
 		{
 			vrApplications = nullptr;
 		}
+
+		::vr::EVRInitError renderModelsError = ::vr::VRInitError_None;
+		vrRenderModels = static_cast<::vr::IVRRenderModels*>(api->GetGenericInterface(::vr::IVRRenderModels_Version, &renderModelsError));
+
+		if (renderModelsError != ::vr::VRInitError_None)
+		{
+			rcx::core::Log("vr: no %s, so no controller tips: %s", ::vr::IVRRenderModels_Version, DescribeInitError(renderModelsError).c_str());
+			vrRenderModels = nullptr;
+		}
+
+		vrInputPaths = vrInput;
+		ForgetControllers();
 
 		rcx::vr::input::BeginSession(vrInput, vrApplications);
 		queuedEvents.clear();
@@ -545,6 +712,37 @@ namespace rcx::vr
 		}
 
 		return rcx::vr::bridge::QueueSubmit(frameId, record.headPose, reason);
+	}
+
+	bool GetControllerInfo(Device hand, ControllerInfo& info, std::string& reason)
+	{
+		if (!running || vrSystem == nullptr)
+		{
+			reason = "VR isn't started";
+			return false;
+		}
+
+		if (hand != Device::LeftHand && hand != Device::RightHand)
+		{
+			reason = "not a hand";
+			return false;
+		}
+
+		bool left = hand == Device::LeftHand;
+		ControllerCache& cache = controllers[left ? 0 : 1];
+		::vr::TrackedDeviceIndex_t deviceIndex = vrSystem->GetTrackedDeviceIndexForControllerRole(left ? ::vr::TrackedControllerRole_LeftHand : ::vr::TrackedControllerRole_RightHand);
+
+		if (!cache.known || cache.deviceIndex != deviceIndex)
+		{
+			RefreshController(hand, cache, deviceIndex);
+		}
+		else if (cache.info.connected && !cache.info.tipValid && !cache.info.renderModel.empty() && std::chrono::steady_clock::now() >= cache.nextTipTry)
+		{
+			TryTip(hand, cache);
+		}
+
+		info = cache.info;
+		return true;
 	}
 }
 

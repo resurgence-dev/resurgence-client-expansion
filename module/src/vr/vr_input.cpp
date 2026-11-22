@@ -39,7 +39,25 @@ namespace rcx::vr::input
 		constexpr const char* kSkeletonLabels[2] = {"Left hand skeleton", "Right hand skeleton"};
 		constexpr const char* kHapticAction = "/actions/rcx/out/haptic";
 		constexpr const char* kHapticLabel = "Vibration";
+		constexpr const char* kEyeGazeAction = "/actions/rcx/in/eye_gaze";
+		constexpr const char* kEyeGazeLabel = "Eye gaze";
 		constexpr const char* kHandPaths[2] = {"/user/hand/left", "/user/hand/right"};
+
+		// The headsets whose driver gives eye tracking as an input component named /eyetracking on the
+		// headset. Their bindings hold only the eye gaze. Steam Link (driver_vrlink) makes that component
+		// for a client with eye tracking once "Share eye tracking data to other apps on this PC" is on.
+		struct HeadsetProfile
+		{
+			const char* controllerType = nullptr;
+			const char* name = nullptr;
+		};
+
+		const HeadsetProfile kHeadsets[] = {
+			{"frame_hmd", "Steam Frame"},
+			{"rift", "Quest and Quest Pro over Steam Link"},
+			{"remote_hmd", "Other Steam Link headsets"},
+		};
+		constexpr const char* kEyeGazeSource = "/user/head/eyetracking";
 		constexpr const wchar_t* kFolderName = L"rcx_vr_input";
 		constexpr size_t kMaxNameLength = 32;
 		constexpr size_t kMaxLabelLength = 48;
@@ -177,6 +195,9 @@ namespace rcx::vr::input
 		::vr::VRInputValueHandle_t handSources[2] = {::vr::k_ulInvalidInputValueHandle, ::vr::k_ulInvalidInputValueHandle};
 		HandSkeleton skeletons[2]{};
 		bool skeletonValid[2] = {false, false};
+		::vr::VRActionHandle_t eyeGazeHandle = ::vr::k_ulInvalidActionHandle;
+		EyeGaze eyeGaze{};
+		::vr::EVRInputError eyeGazeError = ::vr::VRInputError_NoData;
 
 		bool IsValidName(const std::string& name)
 		{
@@ -674,6 +695,19 @@ namespace rcx::vr::input
 			return json;
 		}
 
+		// One headset's default bindings: the eye gaze in the module's set.
+		std::string BuildHeadsetBindings(const HeadsetProfile& headset)
+		{
+			std::string json = "{\n\t\"controller_type\": \"" + std::string(headset.controllerType) + "\",\n";
+			json += "\t\"name\": \"Resurgence defaults\",\n";
+			json += "\t\"description\": \"Written by the Resurgence Client Expansion: the eye gaze (" + std::string(headset.name) + ")\",\n";
+			json += "\t\"bindings\": {\n";
+			json += "\t\t\"" + std::string(kModuleSet) + "\": {\n\t\t\t\"eyetracking\": [\n";
+			json += "\t\t\t\t{\"output\": \"" + std::string(kEyeGazeAction) + "\", \"path\": \"" + kEyeGazeSource + "\"}\n";
+			json += "\t\t\t]\n\t\t}\n\t}\n}\n";
+			return json;
+		}
+
 		std::string BuildManifest()
 		{
 			std::string json = "{\n\t\"default_bindings\": [";
@@ -684,6 +718,12 @@ namespace rcx::vr::input
 				std::string type = kProfiles[index].controllerType;
 				json += index == 0 ? "\n" : ",\n";
 				json += "\t\t{\"controller_type\": \"" + type + "\", \"binding_url\": \"bindings_" + type + ".json\"}";
+			}
+
+			for (const HeadsetProfile& headset : kHeadsets)
+			{
+				std::string type = headset.controllerType;
+				json += ",\n\t\t{\"controller_type\": \"" + type + "\", \"binding_url\": \"bindings_" + type + ".json\"}";
 			}
 
 			json += "\n\t],\n\t\"actions\": [\n";
@@ -697,7 +737,8 @@ namespace rcx::vr::input
 
 			json += "\t\t{\"name\": \"" + std::string(kSkeletonActions[0]) + "\", \"type\": \"skeleton\", \"skeleton\": \"/skeleton/hand/left\"},\n";
 			json += "\t\t{\"name\": \"" + std::string(kSkeletonActions[1]) + "\", \"type\": \"skeleton\", \"skeleton\": \"/skeleton/hand/right\"},\n";
-			json += "\t\t{\"name\": \"" + std::string(kHapticAction) + "\", \"type\": \"vibration\"}\n";
+			json += "\t\t{\"name\": \"" + std::string(kHapticAction) + "\", \"type\": \"vibration\"},\n";
+			json += "\t\t{\"name\": \"" + std::string(kEyeGazeAction) + "\", \"type\": \"eyetracking\", \"requirement\": \"optional\"}\n";
 			json += "\t],\n\t\"action_sets\": [\n";
 
 			for (int set = 0; set < kSetCount; set++)
@@ -715,7 +756,8 @@ namespace rcx::vr::input
 				localization += ",\n\t\t\t\"" + std::string(kSkeletonActions[hand]) + "\": \"" + kSkeletonLabels[hand] + "\"";
 			}
 
-			localization += ",\n\t\t\t\"" + std::string(kHapticAction) + "\": \"" + kHapticLabel + "\"\n\t\t}";
+			localization += ",\n\t\t\t\"" + std::string(kHapticAction) + "\": \"" + kHapticLabel + "\"";
+			localization += ",\n\t\t\t\"" + std::string(kEyeGazeAction) + "\": \"" + kEyeGazeLabel + "\"\n\t\t}";
 			json += "\t\"localization\": [\n" + localization + "\n\t]\n}\n";
 			return json;
 		}
@@ -803,6 +845,16 @@ namespace rcx::vr::input
 				std::filesystem::path bindingPath = folder / (std::string("bindings_") + profile.controllerType + ".json");
 
 				if (!WriteFile(bindingPath, BuildBindings(profile), reason))
+				{
+					return std::string();
+				}
+			}
+
+			for (const HeadsetProfile& headset : kHeadsets)
+			{
+				std::filesystem::path bindingPath = folder / (std::string("bindings_") + headset.controllerType + ".json");
+
+				if (!WriteFile(bindingPath, BuildHeadsetBindings(headset), reason))
 				{
 					return std::string();
 				}
@@ -932,6 +984,9 @@ namespace rcx::vr::input
 			}
 
 			hapticHandle = ::vr::k_ulInvalidActionHandle;
+			eyeGazeHandle = ::vr::k_ulInvalidActionHandle;
+			eyeGaze = EyeGaze{};
+			eyeGazeError = ::vr::VRInputError_NoData;
 
 			for (int hand = 0; hand < 2; hand++)
 			{
@@ -1140,6 +1195,7 @@ namespace rcx::vr::input
 		}
 
 		vrInput->GetActionHandle(kHapticAction, &hapticHandle);
+		vrInput->GetActionHandle(kEyeGazeAction, &eyeGazeHandle);
 
 		manifestDirty = false;
 		setsReady = true;
@@ -1169,6 +1225,9 @@ namespace rcx::vr::input
 		{
 			return;
 		}
+
+		eyeGaze = EyeGaze{};
+		eyeGazeError = ::vr::VRInputError_NoData;
 
 		// The first set Lua named has the highest priority: where two active sets bind one input, it wins.
 		::vr::VRActiveActionSet_t active[kSetCount + 1]{};
@@ -1246,6 +1305,26 @@ namespace rcx::vr::input
 				}
 			}
 		}
+
+		if (eyeGazeHandle == ::vr::k_ulInvalidActionHandle)
+		{
+			eyeGazeError = ::vr::VRInputError_InvalidHandle;
+			return;
+		}
+
+		::vr::VREyeTrackingData_t data{};
+		eyeGazeError = vrInput->GetEyeTrackingDataForNextFrame(eyeGazeHandle, ::vr::TrackingUniverseStanding, &data, sizeof(data));
+
+		if (eyeGazeError != ::vr::VRInputError_None)
+		{
+			return;
+		}
+
+		eyeGaze.active = data.bActive;
+		eyeGaze.valid = data.bValid;
+		eyeGaze.tracked = data.bTracked;
+		eyeGaze.origin = data.vGazeOrigin;
+		eyeGaze.target = data.vGazeTarget;
 	}
 
 	bool GetActions(std::vector<ActionValue>& values, std::string& reason)
@@ -1359,6 +1438,30 @@ namespace rcx::vr::input
 		}
 
 		skeleton = skeletons[index];
+		return true;
+	}
+
+	bool GetEyeGaze(EyeGaze& gaze, std::string& reason)
+	{
+		if (vrInput == nullptr || !setsReady)
+		{
+			reason = "no action sets: call SetActionSets first";
+			return false;
+		}
+
+		if (eyeGazeError != ::vr::VRInputError_None)
+		{
+			reason = DescribeInputError("GetEyeTrackingDataForNextFrame", eyeGazeError);
+			return false;
+		}
+
+		if (!eyeGaze.active)
+		{
+			reason = "no eye tracking: the headset has none, or SteamVR doesn't share it (Steam Link: Share eye tracking data to other apps on this PC)";
+			return false;
+		}
+
+		gaze = eyeGaze;
 		return true;
 	}
 }

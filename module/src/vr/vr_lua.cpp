@@ -361,6 +361,79 @@ namespace rcx::vr
 			return 1;
 		}
 
+		// The controller in a hand's role, for GetTipOffset and GetControllerType; false with a reason on the stack.
+		bool ReadController(ILuaBase* lua, ControllerInfo& info, int& results)
+		{
+			rcx::vr::input::Hand hand = rcx::vr::input::Hand::Left;
+
+			if (!ReadHand(lua, 1, hand))
+			{
+				results = rcx::lua::PushNilReason(lua, "hand must be \"left\" or \"right\"");
+				return false;
+			}
+
+			std::string reason;
+			Device device = hand == rcx::vr::input::Hand::Left ? Device::LeftHand : Device::RightHand;
+
+			if (!rcx::vr::GetControllerInfo(device, info, reason))
+			{
+				results = rcx::lua::PushNilReason(lua, reason);
+				return false;
+			}
+
+			if (!info.connected)
+			{
+				results = rcx::lua::PushNilReason(lua, "no controller in that hand");
+				return false;
+			}
+
+			return true;
+		}
+
+		// SteamVR's pointing pose for a hand (its render model's "tip"), from the controller's tracked
+		// pose: a Vector in meters (forward, left, up) and an Angle, for LocalToWorld onto the pose
+		// GetPoses gives. nil and a reason when there's no controller or its model has no tip.
+		RCX_FUNCTION(GetTipOffset)
+		{
+			ControllerInfo info{};
+			int results = 0;
+
+			if (!ReadController(lua, info, results))
+			{
+				return results;
+			}
+
+			if (!info.tipValid)
+			{
+				return rcx::lua::PushNilReason(lua, "the controller's render model has no tip");
+			}
+
+			Vector forward = ColumnToSource(info.tip, 2, -1.0f);
+			Vector left = ColumnToSource(info.tip, 0, -1.0f);
+			Vector up = ColumnToSource(info.tip, 1, 1.0f);
+
+			lua->PushVector(ColumnToSource(info.tip, 3, 1.0f));
+			lua->PushAngle(AnglesFromAxes(forward, left, up));
+			return 2;
+		}
+
+		// A hand's controller type (Prop_ControllerType_String, "" when the driver doesn't say) and its
+		// render model name. nil and a reason when there's no controller.
+		RCX_FUNCTION(GetControllerType)
+		{
+			ControllerInfo info{};
+			int results = 0;
+
+			if (!ReadController(lua, info, results))
+			{
+				return results;
+			}
+
+			lua->PushString(info.controllerType.c_str(), static_cast<unsigned int>(info.controllerType.size()));
+			lua->PushString(info.renderModel.c_str(), static_cast<unsigned int>(info.renderModel.size()));
+			return 2;
+		}
+
 		RCX_FUNCTION(Submit)
 		{
 			int64_t frameId = 0;
@@ -592,6 +665,71 @@ namespace rcx::vr
 			return 1;
 		}
 
+		// The eye gaze this frame, from the headset's eye tracker through SteamVR input. Four values: the
+		// gaze direction relative to the head (a unit Vector, forward, left, up), the gaze origin and its
+		// fixation point in the standing tracking space (Vectors in meters, the axes GetPoses uses), and
+		// whether the eyes are tracked right now. nil and a reason with no eye tracker, data SteamVR
+		// doesn't share, data that isn't valid, or no head pose.
+		RCX_FUNCTION(GetEyeGaze)
+		{
+			rcx::vr::input::EyeGaze gaze{};
+			std::string reason;
+
+			if (!rcx::vr::input::GetEyeGaze(gaze, reason))
+			{
+				return rcx::lua::PushNilReason(lua, reason);
+			}
+
+			if (!gaze.valid)
+			{
+				return rcx::lua::PushNilReason(lua, "the eye tracking data isn't valid");
+			}
+
+			DevicePose poses[static_cast<int>(Device::Count)]{};
+			uint32_t frameId = 0;
+
+			if (!rcx::vr::GetPoses(poses, frameId, reason))
+			{
+				return rcx::lua::PushNilReason(lua, reason);
+			}
+
+			const DevicePose& head = poses[static_cast<int>(Device::Head)];
+
+			if (!head.valid)
+			{
+				return rcx::lua::PushNilReason(lua, "no head pose");
+			}
+
+			double direction[3] = {
+				static_cast<double>(gaze.target.v[0]) - gaze.origin.v[0],
+				static_cast<double>(gaze.target.v[1]) - gaze.origin.v[1],
+				static_cast<double>(gaze.target.v[2]) - gaze.origin.v[2],
+			};
+			double length = std::sqrt(direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2]);
+
+			if (!std::isfinite(length) || length < 1e-4)
+			{
+				return rcx::lua::PushNilReason(lua, "the gaze origin and target are the same point");
+			}
+
+			// Into the head's space: the head matrix's rotation transposed.
+			double local[3]{};
+
+			for (int axis = 0; axis < 3; axis++)
+			{
+				for (int row = 0; row < 3; row++)
+				{
+					local[axis] += static_cast<double>(head.matrix.m[row][axis]) * direction[row] / length;
+				}
+			}
+
+			lua->PushVector(ToSource(static_cast<float>(local[0]), static_cast<float>(local[1]), static_cast<float>(local[2])));
+			lua->PushVector(ToSource(gaze.origin.v[0], gaze.origin.v[1], gaze.origin.v[2]));
+			lua->PushVector(ToSource(gaze.target.v[0], gaze.target.v[1], gaze.target.v[2]));
+			lua->PushBool(gaze.tracked);
+			return 4;
+		}
+
 		RCX_FUNCTION(GetPlayArea)
 		{
 			PlayArea playArea{};
@@ -795,6 +933,8 @@ namespace rcx::vr
 		SetFunction(lua, "SetTextureBounds", SetTextureBounds);
 		SetFunction(lua, "WaitFrame", WaitFrame);
 		SetFunction(lua, "GetPoses", GetPoses);
+		SetFunction(lua, "GetTipOffset", GetTipOffset);
+		SetFunction(lua, "GetControllerType", GetControllerType);
 		SetFunction(lua, "Submit", Submit);
 		SetFunction(lua, "GetStats", GetStats);
 		SetFunction(lua, "RegisterAction", RegisterAction);
@@ -802,6 +942,7 @@ namespace rcx::vr
 		SetFunction(lua, "GetActions", GetActions);
 		SetFunction(lua, "Haptic", Haptic);
 		SetFunction(lua, "GetHandSkeleton", GetHandSkeleton);
+		SetFunction(lua, "GetEyeGaze", GetEyeGaze);
 		SetFunction(lua, "GetPlayArea", GetPlayArea);
 		SetFunction(lua, "Fade", Fade);
 		SetFunction(lua, "PollEvents", PollEvents);

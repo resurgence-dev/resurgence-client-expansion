@@ -14,8 +14,9 @@
 	to the DLL, and hands OpenVR that path. Nothing from Lua becomes a path: names are checked to
 	[a-z0-9_] and bindings come from the list.
 
-	The module adds its own actions beside Lua's: a skeleton per hand (finger curl) and one haptic
-	output. Lua thread only.
+	The module adds its own actions beside Lua's: a skeleton per hand (finger curl), one haptic
+	output and the eye gaze (an eyetracking action, with default bindings for the headsets that have
+	eye tracking). Lua thread only.
 */
 namespace rcx::vr::input
 {
@@ -50,6 +51,19 @@ namespace rcx::vr::input
 		float splay[4]{};
 	};
 
+	// The headset's eye gaze from the module's eyetracking action (bound to /user/head/eyetracking in
+	// the headset bindings), in the standing tracking space: OpenVR's axes, meters.
+	struct EyeGaze
+	{
+		// bActive: the action is bound to a source that's there. bValid: the data can be used.
+		// bTracked: the eyes are tracked right now (false through a blink or a lost eye).
+		bool active = false;
+		bool valid = false;
+		bool tracked = false;
+		::vr::HmdVector3_t origin{};
+		::vr::HmdVector3_t target{};
+	};
+
 	constexpr size_t kMaxActions = 48;
 
 	// label: the name SteamVR's binding screen shows ("" shows the name). set: "main" (also ""),
@@ -73,6 +87,11 @@ namespace rcx::vr::input
 	bool GetActions(std::vector<ActionValue>& values, std::string& reason);
 	bool Haptic(Hand hand, float seconds, float frequency, float amplitude, std::string& reason);
 	bool GetHandSkeleton(Hand hand, HandSkeleton& skeleton, std::string& reason);
+
+	// The gaze Update read this frame (GetEyeTrackingDataForNextFrame), or false with reason set when
+	// there's no action set, the read failed or the action isn't active (no eye tracker, or SteamVR
+	// doesn't share its data).
+	bool GetEyeGaze(EyeGaze& gaze, std::string& reason);
 
 	// How many inputs the loaded binding puts on a registered action (0 when none), or false with reason set.
 	bool GetActionOrigins(const std::string& name, uint32_t& count, std::string& reason);
