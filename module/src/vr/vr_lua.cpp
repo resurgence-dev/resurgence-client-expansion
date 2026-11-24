@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/lua_util.h"
@@ -513,7 +514,7 @@ namespace rcx::vr
 
 			if (!ReadShortString(lua, 1, name) || !ReadShortString(lua, 2, kind))
 			{
-				return rcx::lua::PushFailure(lua, "RegisterAction(name, kind, binding, label, set): name and kind must be short strings");
+				return rcx::lua::PushFailure(lua, "RegisterAction(name, kind, binding, label, set, overrides): name and kind must be short strings");
 			}
 
 			if (!IsAbsent(lua, 3) && !ReadShortString(lua, 3, binding))
@@ -531,9 +532,38 @@ namespace rcx::vr
 				return rcx::lua::PushFailure(lua, "set must be a short string or nil");
 			}
 
+			std::vector<std::pair<std::string, std::string>> overrides;
+
+			if (!IsAbsent(lua, 6))
+			{
+				if (!lua->IsType(6, Type::Table))
+				{
+					return rcx::lua::PushFailure(lua, "overrides must be a table of controller type to binding, or nil");
+				}
+
+				for (const std::string& type : rcx::vr::input::GetControllerTypes())
+				{
+					lua->GetField(6, type.c_str());
+					std::string text;
+					bool absent = lua->IsType(-1, Type::Nil);
+					bool read = !absent && ReadShortString(lua, -1, text);
+					lua->Pop();
+
+					if (!absent && !read)
+					{
+						return rcx::lua::PushFailure(lua, "an override is a short string");
+					}
+
+					if (read)
+					{
+						overrides.emplace_back(type, text);
+					}
+				}
+			}
+
 			std::string reason;
 
-			if (!rcx::vr::input::RegisterAction(name, kind, binding, label, set, reason))
+			if (!rcx::vr::input::RegisterAction(name, kind, binding, label, set, overrides, reason))
 			{
 				return rcx::lua::PushFailure(lua, reason);
 			}
@@ -791,15 +821,65 @@ namespace rcx::vr
 				return rcx::lua::PushNilReason(lua, "GetActionOrigins(name): name must be a short string");
 			}
 
-			uint32_t count = 0;
+			std::vector<rcx::vr::input::ActionOrigin> origins;
 			std::string reason;
 
-			if (!rcx::vr::input::GetActionOrigins(name, count, reason))
+			if (!rcx::vr::input::GetActionOrigins(name, origins, reason))
 			{
 				return rcx::lua::PushNilReason(lua, reason);
 			}
 
-			lua->PushNumber(static_cast<double>(count));
+			// the count first, as before 0.68, then one table per input
+			lua->PushNumber(static_cast<double>(origins.size()));
+			lua->CreateTable();
+
+			for (size_t index = 0; index < origins.size(); index++)
+			{
+				const rcx::vr::input::ActionOrigin& origin = origins[index];
+				const std::pair<const char*, const std::string*> fields[] = {
+					{"hand", &origin.hand},
+					{"name", &origin.name},
+					{"shortName", &origin.shortName},
+					{"controllerType", &origin.controllerType},
+					{"devicePath", &origin.devicePath},
+					{"inputPath", &origin.inputPath},
+					{"mode", &origin.mode},
+					{"slot", &origin.slot},
+					{"sourceType", &origin.sourceType},
+				};
+
+				lua->PushNumber(static_cast<double>(index + 1));
+				lua->CreateTable();
+
+				for (const auto& field : fields)
+				{
+					lua->PushString(field.second->c_str(), static_cast<unsigned int>(field.second->size()));
+					lua->SetField(-2, field.first);
+				}
+
+				lua->SetTable(-3);
+			}
+
+			return 2;
+		}
+
+		RCX_FUNCTION(ShowActionOrigins)
+		{
+			std::string name;
+
+			if (!ReadShortString(lua, 1, name))
+			{
+				return rcx::lua::PushNilReason(lua, "ShowActionOrigins(name): name must be a short string");
+			}
+
+			std::string reason;
+
+			if (!rcx::vr::input::ShowActionOrigins(name, reason))
+			{
+				return rcx::lua::PushNilReason(lua, reason);
+			}
+
+			lua->PushBool(true);
 			return 1;
 		}
 
@@ -957,6 +1037,7 @@ namespace rcx::vr
 		SetFunction(lua, "Fade", Fade);
 		SetFunction(lua, "PollEvents", PollEvents);
 		SetFunction(lua, "GetActionOrigins", GetActionOrigins);
+		SetFunction(lua, "ShowActionOrigins", ShowActionOrigins);
 		SetFunction(lua, "ShowKeyboard", ShowKeyboard);
 		SetFunction(lua, "HideKeyboard", HideKeyboard);
 		SetFunction(lua, "IsKeyboardOpen", IsKeyboardOpen);

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "openvr.h"
@@ -64,11 +65,40 @@ namespace rcx::vr::input
 		::vr::HmdVector3_t target{};
 	};
 
+	// One input the loaded binding puts on an action. hand: "left", "right" or "" (not on a hand).
+	// name: SteamVR's localized name with the hand, controller type and input source; shortName: the
+	// input source alone ("A Button"). devicePath, inputPath, mode, slot and sourceType come from
+	// GetActionBindingInfo ("" when it gave none for this origin); controllerType is the device's
+	// Prop_ControllerType_String ("knuckles").
+	struct ActionOrigin
+	{
+		std::string hand;
+		std::string name;
+		std::string shortName;
+		std::string controllerType;
+		std::string devicePath;
+		std::string inputPath;
+		std::string mode;
+		std::string slot;
+		std::string sourceType;
+	};
+
 	constexpr size_t kMaxActions = 48;
 
 	// label: the name SteamVR's binding screen shows ("" shows the name). set: "main" (also ""),
 	// "pointer", "pipboy" or "weapon".
 	bool RegisterAction(const std::string& name, const std::string& kind, const std::string& binding, const std::string& label, const std::string& set, std::string& reason);
+
+	// overrides: per controller type, that controller's own default in place of the shared binding, in
+	// its own input names. Only frame_controller takes one (its inputs: stick, stick_click, trigger,
+	// grip and bumper on both hands; a, b, x, y and menu on the right; view and dpad_up, dpad_right,
+	// dpad_down, dpad_left on the left). A value is "" (no default there), "<hand>_<input>" with an
+	// optional press type on a button, or "<hand>_<input>+<hand>_<input>", a chord of two buttons'
+	// clicks for a boolean action.
+	bool RegisterAction(const std::string& name, const std::string& kind, const std::string& binding, const std::string& label, const std::string& set, const std::vector<std::pair<std::string, std::string>>& overrides, std::string& reason);
+
+	// The controller types the module writes default bindings for, the keys an override can use.
+	std::vector<std::string> GetControllerTypes();
 
 	// Writes the manifest and bindings when they changed, loads them into OpenVR, and makes the named
 	// sets the active ones, the first with the highest priority; an empty list means "main". The
@@ -78,7 +108,7 @@ namespace rcx::vr::input
 	// The session's IVRInput (or nullptr when the runtime has none) at start, and its end. The first
 	// start in the process also claims the game's own app key (Identify), so SteamVR keeps its
 	// bindings apart from other Garry's Mod VR addons'.
-	void BeginSession(::vr::IVRInput* input, ::vr::IVRApplications* applications);
+	void BeginSession(::vr::IVRInput* input, ::vr::IVRApplications* applications, ::vr::IVRSystem* system);
 	void EndSession();
 
 	// Once per frame, after WaitGetPoses.
@@ -93,8 +123,22 @@ namespace rcx::vr::input
 	// doesn't share its data).
 	bool GetEyeGaze(EyeGaze& gaze, std::string& reason);
 
-	// How many inputs the loaded binding puts on a registered action (0 when none), or false with reason set.
-	bool GetActionOrigins(const std::string& name, uint32_t& count, std::string& reason);
+	// The inputs the loaded binding puts on a registered action (none when it puts none), or false with
+	// reason set. Read once per action and kept until ForgetOrigins; an empty read isn't kept, so the
+	// next call asks SteamVR again.
+	bool GetActionOrigins(const std::string& name, std::vector<ActionOrigin>& origins, std::string& reason);
+
+	// Drops the kept origins: the session calls it when SteamVR reloads the bindings or a controller
+	// changes, and loading new handles (SetActionSets, a session start) drops them too.
+	void ForgetOrigins();
+
+	// Highlights the action's inputs in SteamVR's overlay (IVRInput::ShowActionOrigins).
+	bool ShowActionOrigins(const std::string& name, std::string& reason);
+
+	// For each origin's hand, the index of the binding info it takes (-1 for none): the first unused
+	// entry whose device path is that hand's (/user/hand/left or /user/hand/right), else, when the
+	// counts agree, the entry at the origin's own index. Pure, for tests/input_files_test.cpp.
+	std::vector<int> MatchBindingInfo(const std::vector<std::string>& originHands, const std::vector<std::string>& bindingDevicePaths);
 
 	// Writes the action manifest, the default bindings and the application manifest without a session,
 	// for tests/input_files_test.cpp. Not reachable from Lua.

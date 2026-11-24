@@ -164,11 +164,19 @@ namespace rcx::vr
 					break;
 				case ::vr::VREvent_TrackedDeviceRoleChanged:
 					ForgetControllers();
+					rcx::vr::input::ForgetOrigins();
 					QueueEvent("controllers_changed", 0.0f);
 					break;
 				case ::vr::VREvent_TrackedDeviceActivated:
 				case ::vr::VREvent_TrackedDeviceUpdated:
 					ForgetControllers();
+					rcx::vr::input::ForgetOrigins();
+					break;
+				case ::vr::VREvent_ActionBindingReloaded:
+				case ::vr::VREvent_Input_BindingLoadSuccessful:
+					// a rebind in SteamVR: the next GetActionOrigins reads the new inputs
+					rcx::vr::input::ForgetOrigins();
+					QueueEvent("bindings_changed", 0.0f);
 					break;
 				case ::vr::VREvent_PropertyChanged:
 					if (event.data.property.prop == ::vr::Prop_RenderModelName_String || event.data.property.prop == ::vr::Prop_ControllerType_String)
@@ -205,6 +213,7 @@ namespace rcx::vr
 					break;
 				case ::vr::VREvent_TrackedDeviceDeactivated:
 					ForgetControllers();
+					rcx::vr::input::ForgetOrigins();
 
 					if (event.trackedDeviceIndex == ::vr::k_unTrackedDeviceIndex_Hmd)
 					{
@@ -493,7 +502,7 @@ namespace rcx::vr
 		vrInputPaths = vrInput;
 		ForgetControllers();
 
-		rcx::vr::input::BeginSession(vrInput, vrApplications);
+		rcx::vr::input::BeginSession(vrInput, vrApplications, vrSystem);
 		queuedEvents.clear();
 
 		if (!rcx::vr::bridge::BeginSession(vrSystem, vrCompositor, reason))

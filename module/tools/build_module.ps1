@@ -186,6 +186,16 @@ if ((Test-Path $meshTest) -and (Test-Path $meshFixtures)) {
 	}
 }
 
+# rcx.sys's memory reading on this machine; a failure fails the build.
+$sysTest = Join-Path $testsDir "rcx_sys_memory_test.exe"
+if (Test-Path $sysTest) {
+	& $sysTest
+	if ($LASTEXITCODE -ne 0) {
+		Write-Host "FAILED: rcx_sys_memory_test" -ForegroundColor Red
+		exit 1
+	}
+}
+
 if ($Install) {
 	Write-Host "== Install into $luaBin" -ForegroundColor Cyan
 	if (-not (Test-CanReplace)) { exit 1 }

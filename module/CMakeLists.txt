@@ -40,6 +40,8 @@ add_library(gmcl_rcx SHARED
 	src/mesh/mesh_merge.cpp
 	src/mesh/mesh_worker.cpp
 	src/mesh/mesh_lua.cpp
+	src/sys/sys_memory.cpp
+	src/sys/sys_lua.cpp
 )
 target_include_directories(gmcl_rcx PRIVATE
 	src
@@ -92,3 +94,11 @@ target_compile_definitions(rcx_mesh_merge_test PRIVATE WIN32_LEAN_AND_MEAN NOMIN
 target_compile_options(rcx_mesh_merge_test PRIVATE /W4 /EHsc /permissive-)
 set_property(TARGET rcx_mesh_merge_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set_target_properties(rcx_mesh_merge_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${RCX_OUTPUT_DIR}/tests/$<0:>")
+
+# rcx.sys's memory reading on this machine (tests/sys_memory_test.cpp): process, physical, commit and VRAM numbers are sane.
+add_executable(rcx_sys_memory_test tests/sys_memory_test.cpp src/sys/sys_memory.cpp)
+target_include_directories(rcx_sys_memory_test PRIVATE src)
+target_compile_definitions(rcx_sys_memory_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_compile_options(rcx_sys_memory_test PRIVATE /W4 /EHsc /permissive-)
+set_property(TARGET rcx_sys_memory_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_target_properties(rcx_sys_memory_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${RCX_OUTPUT_DIR}/tests/$<0:>")

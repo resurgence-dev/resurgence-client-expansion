@@ -103,6 +103,24 @@ namespace rcx::vr::input
 		constexpr const char* kLongPressDelay = "0.3";
 		constexpr const char* kDoublePressDelay = "0.2";
 
+		struct NamedInput;
+
+		struct OverrideInput
+		{
+			int side = 0;
+			const NamedInput* input = nullptr;
+		};
+
+		// A controller's own default for an action in place of the shared binding: no input (no default
+		// there), one input with a press type, or a chord of two inputs. text: what Lua gave.
+		struct Override
+		{
+			std::string controllerType;
+			std::string text;
+			Press press = Press::Click;
+			std::vector<OverrideInput> inputs;
+		};
+
 		struct Action
 		{
 			std::string name;
@@ -110,8 +128,11 @@ namespace rcx::vr::input
 			int set = 0;
 			ActionKind kind = ActionKind::Boolean;
 			Binding binding{};
+			std::vector<Override> overrides;
 			::vr::VRActionHandle_t handle = ::vr::k_ulInvalidActionHandle;
 			ActionValue value{};
+			bool originsRead = false;
+			std::vector<ActionOrigin> origins;
 		};
 
 		// How one controller type spells a slot: the source path under the hand, its mode, and the
@@ -125,6 +146,38 @@ namespace rcx::vr::input
 			const char* vector2Component = "";
 		};
 
+		// One input a controller has, by the name an override binding gives it ("dpad_up"), and the hands it's on.
+		struct NamedInput
+		{
+			const char* name = nullptr;
+			bool onLeft = false;
+			bool onRight = false;
+			SlotSpelling spelling{};
+		};
+
+		// The Steam Frame's inputs, from the driver's frame_controller_profile.json: a, b, x, y and the menu
+		// button on the right hand, the pad and the view button on the left. The system button stays
+		// SteamVR's and the thumbrest is touch only, so neither is here.
+		const NamedInput kFrameInputs[] = {
+			{"stick", true, true, {"/input/thumbstick", "joystick", "", "", "position"}},
+			{"stick_click", true, true, {"/input/thumbstick", "joystick", "click", "", ""}},
+			{"trigger", true, true, {"/input/trigger", "trigger", "click", "pull", ""}},
+			{"grip", true, true, {"/input/grip", "trigger", "click", "pull", ""}},
+			{"bumper", true, true, {"/input/bumper", "button", "click", "", ""}},
+			{"a", false, true, {"/input/a", "button", "click", "", ""}},
+			{"b", false, true, {"/input/b", "button", "click", "", ""}},
+			{"x", false, true, {"/input/x", "button", "click", "", ""}},
+			{"y", false, true, {"/input/y", "button", "click", "", ""}},
+			{"menu", false, true, {"/input/menu", "button", "click", "", ""}},
+			{"view", true, false, {"/input/view", "button", "click", "", ""}},
+			{"dpad_up", true, false, {"/input/dpad_up", "button", "click", "", ""}},
+			{"dpad_right", true, false, {"/input/dpad_right", "button", "click", "", ""}},
+			{"dpad_down", true, false, {"/input/dpad_down", "button", "click", "", ""}},
+			{"dpad_left", true, false, {"/input/dpad_left", "button", "click", "", ""}},
+		};
+
+		// inputs: the controller's named inputs, for the per-controller overrides RegisterAction takes;
+		// nullptr where a controller takes none.
 		struct ControllerProfile
 		{
 			const char* controllerType = nullptr;
@@ -135,6 +188,8 @@ namespace rcx::vr::input
 			SlotSpelling grip{};
 			SlotSpelling a[2]{};
 			SlotSpelling b[2]{};
+			const NamedInput* inputs = nullptr;
+			size_t inputCount = 0;
 		};
 
 		const ControllerProfile kProfiles[] = {
@@ -157,6 +212,20 @@ namespace rcx::vr::input
 				{"/input/grip", "trigger", "click", "pull", ""},
 				{{"/input/x", "button", "click", "", ""}, {"/input/a", "button", "click", "", ""}},
 				{{"/input/y", "button", "click", "", ""}, {"/input/b", "button", "click", "", ""}},
+			},
+			{
+				// Steam Frame: a, b, x and y on the right, a four-way pad on the left. The left a and b slots are empty,
+				// since the pad isn't two face buttons: an action on them needs a frame_controller override to have a default here.
+				"frame_controller",
+				"Steam Frame",
+				{"/input/thumbstick", "joystick", "", "", "position"},
+				{"/input/thumbstick", "joystick", "click", "", ""},
+				{"/input/trigger", "trigger", "click", "pull", ""},
+				{"/input/grip", "trigger", "click", "pull", ""},
+				{{}, {"/input/a", "button", "click", "", ""}},
+				{{}, {"/input/b", "button", "click", "", ""}},
+				kFrameInputs,
+				sizeof(kFrameInputs) / sizeof(kFrameInputs[0]),
 			},
 			{
 				"vive_controller",
@@ -183,6 +252,7 @@ namespace rcx::vr::input
 
 		std::vector<Action> actions;
 		::vr::IVRInput* vrInput = nullptr;
+		::vr::IVRSystem* vrSystem = nullptr;
 		bool setsReady = false;
 		bool manifestDirty = true;
 		::vr::VRActionSetHandle_t setHandles[kSetCount]{};
@@ -288,18 +358,9 @@ namespace rcx::vr::input
 			return std::string("/actions/") + kSets[set].name;
 		}
 
-		bool ParseBinding(const std::string& text, Binding& binding)
+		// Takes a press type suffix (_single, _double, _long, _held) off the end of body, into press.
+		void StripPress(std::string& body, Press& press)
 		{
-			binding = Binding{};
-
-			if (text.empty())
-			{
-				return true;
-			}
-
-			std::string slotName;
-			std::string body = text;
-
 			struct PressName
 			{
 				const char* suffix = nullptr;
@@ -319,11 +380,25 @@ namespace rcx::vr::input
 
 				if (body.size() > length && body.compare(body.size() - length, length, entry.suffix) == 0)
 				{
-					binding.press = entry.press;
+					press = entry.press;
 					body = body.substr(0, body.size() - length);
-					break;
+					return;
 				}
 			}
+		}
+
+		bool ParseBinding(const std::string& text, Binding& binding)
+		{
+			binding = Binding{};
+
+			if (text.empty())
+			{
+				return true;
+			}
+
+			std::string slotName;
+			std::string body = text;
+			StripPress(body, binding.press);
 
 			if (body.compare(0, 5, "both_") == 0)
 			{
@@ -524,21 +599,35 @@ namespace rcx::vr::input
 
 		// The component an action binds to on a slot: a press type's own input on a "button" mode source;
 		// elsewhere a single press falls back to the plain click and the other press types to nothing.
-		std::string ComponentForAction(const SlotSpelling& spelling, const Action& action)
+		std::string ComponentForPress(const SlotSpelling& spelling, ActionKind kind, Press press)
 		{
-			std::string component = ComponentFor(spelling, action.kind);
+			std::string component = ComponentFor(spelling, kind);
 
-			if (action.binding.press == Press::Click || component.empty())
+			if (press == Press::Click || component.empty())
 			{
 				return component;
 			}
 
 			if (std::string(spelling.mode) == "button")
 			{
-				return PressComponent(action.binding.press);
+				return PressComponent(press);
 			}
 
-			return action.binding.press == Press::Single ? component : std::string();
+			return press == Press::Single ? component : std::string();
+		}
+
+		// The action's override for this controller, or nullptr when it follows the shared binding there.
+		const Override* FindOverride(const Action& action, const ControllerProfile& profile)
+		{
+			for (const Override& entry : action.overrides)
+			{
+				if (entry.controllerType == profile.controllerType)
+				{
+					return &entry;
+				}
+			}
+
+			return nullptr;
 		}
 
 		// One set's sources on one controller. Two actions of the set that land on the same component keep the first.
@@ -548,26 +637,52 @@ namespace rcx::vr::input
 
 			for (const Action& action : actions)
 			{
-				if (action.set != set || action.binding.chord)
+				if (action.set != set)
 				{
 					continue;
 				}
 
-				const SlotSpelling* spelling = Spell(profile, action.binding);
+				const Override* override = FindOverride(action, profile);
+				const SlotSpelling* spelling = nullptr;
+				int side = 0;
+				Press press = Press::Click;
+
+				if (override != nullptr)
+				{
+					if (override->inputs.size() != 1)
+					{
+						continue;
+					}
+
+					spelling = &override->inputs[0].input->spelling;
+					side = override->inputs[0].side;
+					press = override->press;
+				}
+				else
+				{
+					if (action.binding.chord)
+					{
+						continue;
+					}
+
+					spelling = Spell(profile, action.binding);
+					side = action.binding.side;
+					press = action.binding.press;
+				}
 
 				if (spelling == nullptr || spelling->path == nullptr)
 				{
 					continue;
 				}
 
-				std::string component = ComponentForAction(*spelling, action);
+				std::string component = ComponentForPress(*spelling, action.kind, press);
 
 				if (component.empty())
 				{
 					continue;
 				}
 
-				std::string path = std::string(kHandPaths[action.binding.side]) + spelling->path;
+				std::string path = std::string(kHandPaths[side]) + spelling->path;
 				Source* source = nullptr;
 
 				for (Source& existing : sources)
@@ -631,15 +746,37 @@ namespace rcx::vr::input
 			return json;
 		}
 
-		// One set's chords on one controller: each "both_" action as its slot's boolean input on both hands.
-		// A slot this controller lacks, or with no boolean input, leaves the action out.
+		// One set's chords on one controller: each "both_" action as its slot's boolean input on both hands,
+		// and each override of two inputs as those. A slot this controller lacks, or with no boolean input,
+		// leaves the action out.
 		std::string ChordsJson(const ControllerProfile& profile, int set)
 		{
 			std::string json;
 
 			for (const Action& action : actions)
 			{
-				if (action.set != set || !action.binding.chord || action.kind != ActionKind::Boolean)
+				if (action.set != set || action.kind != ActionKind::Boolean)
+				{
+					continue;
+				}
+
+				const Override* override = FindOverride(action, profile);
+
+				if (override != nullptr)
+				{
+					if (override->inputs.size() != 2)
+					{
+						continue;
+					}
+
+					const OverrideInput& first = override->inputs[0];
+					const OverrideInput& second = override->inputs[1];
+					json += json.empty() ? "\n" : ",\n";
+					json += "\t\t\t\t{\"output\": \"" + ActionPath(action) + "\", \"inputs\": [[\"" + std::string(kHandPaths[first.side]) + first.input->spelling.path + "\", \"" + first.input->spelling.booleanComponent + "\"], [\"" + std::string(kHandPaths[second.side]) + second.input->spelling.path + "\", \"" + second.input->spelling.booleanComponent + "\"]]}";
+					continue;
+				}
+
+				if (!action.binding.chord)
 				{
 					continue;
 				}
@@ -999,11 +1136,278 @@ namespace rcx::vr::input
 			{
 				action.handle = ::vr::k_ulInvalidActionHandle;
 				action.value = ActionValue{action.name, action.kind};
+				action.originsRead = false;
+				action.origins.clear();
 			}
+		}
+
+		std::string OriginName(::vr::VRInputValueHandle_t origin, int32_t sections)
+		{
+			char name[256]{};
+
+			if (vrInput->GetOriginLocalizedName(origin, name, sizeof(name), sections) != ::vr::VRInputError_None)
+			{
+				return "";
+			}
+
+			return name;
+		}
+
+		std::string ControllerTypeOf(::vr::TrackedDeviceIndex_t device)
+		{
+			if (vrSystem == nullptr || device == ::vr::k_unTrackedDeviceIndexInvalid)
+			{
+				return "";
+			}
+
+			char type[128]{};
+			::vr::ETrackedPropertyError error = ::vr::TrackedProp_Success;
+			vrSystem->GetStringTrackedDeviceProperty(device, ::vr::Prop_ControllerType_String, type, sizeof(type), &error);
+			return error == ::vr::TrackedProp_Success ? type : "";
+		}
+
+		std::string HandOf(const ::vr::InputOriginInfo_t& info)
+		{
+			for (int hand = 0; hand < 2; hand++)
+			{
+				if (handSources[hand] != ::vr::k_ulInvalidInputValueHandle && info.devicePath == handSources[hand])
+				{
+					return hand == 0 ? "left" : "right";
+				}
+			}
+
+			if (vrSystem != nullptr && info.trackedDeviceIndex != ::vr::k_unTrackedDeviceIndexInvalid)
+			{
+				::vr::ETrackedControllerRole role = vrSystem->GetControllerRoleForTrackedDeviceIndex(info.trackedDeviceIndex);
+
+				if (role == ::vr::TrackedControllerRole_LeftHand)
+				{
+					return "left";
+				}
+
+				if (role == ::vr::TrackedControllerRole_RightHand)
+				{
+					return "right";
+				}
+			}
+
+			return "";
+		}
+
+		bool ReadOrigins(Action& action, std::string& reason)
+		{
+			::vr::VRInputValueHandle_t handles[::vr::k_unMaxActionOriginCount]{};
+			::vr::EVRInputError error = vrInput->GetActionOrigins(setHandles[action.set], action.handle, handles, ::vr::k_unMaxActionOriginCount);
+
+			if (error != ::vr::VRInputError_None)
+			{
+				reason = DescribeInputError("GetActionOrigins", error);
+				return false;
+			}
+
+			std::vector<ActionOrigin> origins;
+			std::vector<std::string> hands;
+
+			for (::vr::VRInputValueHandle_t handle : handles)
+			{
+				if (handle == ::vr::k_ulInvalidInputValueHandle)
+				{
+					continue;
+				}
+
+				ActionOrigin origin;
+				origin.name = OriginName(handle, static_cast<int32_t>(::vr::VRInputString_All));
+				origin.shortName = OriginName(handle, ::vr::VRInputString_InputSource);
+
+				::vr::InputOriginInfo_t info{};
+				info.trackedDeviceIndex = ::vr::k_unTrackedDeviceIndexInvalid;
+
+				if (vrInput->GetOriginTrackedDeviceInfo(handle, &info, sizeof(info)) == ::vr::VRInputError_None)
+				{
+					origin.hand = HandOf(info);
+					origin.controllerType = ControllerTypeOf(info.trackedDeviceIndex);
+				}
+
+				hands.push_back(origin.hand);
+				origins.push_back(origin);
+			}
+
+			// The binding info is optional: a failed read leaves the paths empty.
+			::vr::InputBindingInfo_t bindings[::vr::k_unMaxActionOriginCount]{};
+			uint32_t bindingCount = 0;
+
+			if (!origins.empty() && vrInput->GetActionBindingInfo(action.handle, bindings, sizeof(bindings[0]), ::vr::k_unMaxActionOriginCount, &bindingCount) == ::vr::VRInputError_None)
+			{
+				std::vector<std::string> devicePaths;
+
+				for (uint32_t index = 0; index < bindingCount && index < ::vr::k_unMaxActionOriginCount; index++)
+				{
+					devicePaths.push_back(bindings[index].rchDevicePathName);
+				}
+
+				std::vector<int> matched = MatchBindingInfo(hands, devicePaths);
+
+				for (size_t index = 0; index < origins.size(); index++)
+				{
+					if (matched[index] < 0)
+					{
+						continue;
+					}
+
+					const ::vr::InputBindingInfo_t& binding = bindings[matched[index]];
+					origins[index].devicePath = binding.rchDevicePathName;
+					origins[index].inputPath = binding.rchInputPathName;
+					origins[index].mode = binding.rchModeName;
+					origins[index].slot = binding.rchSlotName;
+					origins[index].sourceType = binding.rchInputSourceType;
+				}
+			}
+
+			// No origins is kept for no call: before SteamVR has loaded the binding, or before the controllers
+			// are on, it reads zero for bound actions too, and nothing may come later to drop it.
+			action.origins = origins;
+			action.originsRead = !origins.empty();
+			return true;
+		}
+
+		// One input of an override: left_ or right_ and a name from the profile's inputs that the hand has.
+		bool ParseOverrideInput(const ControllerProfile& profile, const std::string& text, OverrideInput& result)
+		{
+			std::string inputName;
+
+			if (text.compare(0, 5, "left_") == 0)
+			{
+				result.side = 0;
+				inputName = text.substr(5);
+			}
+			else if (text.compare(0, 6, "right_") == 0)
+			{
+				result.side = 1;
+				inputName = text.substr(6);
+			}
+			else
+			{
+				return false;
+			}
+
+			for (size_t index = 0; index < profile.inputCount; index++)
+			{
+				const NamedInput& input = profile.inputs[index];
+
+				if (inputName == input.name && (result.side == 0 ? input.onLeft : input.onRight))
+				{
+					result.input = &input;
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		// An override binding: "" (no default on this controller), "<hand>_<input>" with an optional press
+		// type, or "<hand>_<input>+<hand>_<input>", a chord of two inputs (a plain click of each, boolean only).
+		bool ParseOverride(const ControllerProfile& profile, const std::string& text, ActionKind kind, Override& result, std::string& reason)
+		{
+			result = Override{};
+			result.controllerType = profile.controllerType;
+			result.text = text;
+
+			if (profile.inputs == nullptr)
+			{
+				reason = std::string(profile.controllerType) + " takes no override: its defaults come from the shared binding";
+				return false;
+			}
+
+			if (text.empty())
+			{
+				return true;
+			}
+
+			std::vector<std::string> parts;
+			size_t start = 0;
+
+			while (true)
+			{
+				size_t plus = text.find('+', start);
+				parts.push_back(text.substr(start, plus == std::string::npos ? std::string::npos : plus - start));
+
+				if (plus == std::string::npos)
+				{
+					break;
+				}
+
+				start = plus + 1;
+			}
+
+			if (parts.size() > 2)
+			{
+				reason = "an override chord is two inputs joined by +";
+				return false;
+			}
+
+			for (std::string& part : parts)
+			{
+				Press press = Press::Click;
+				StripPress(part, press);
+				OverrideInput input{};
+
+				if (!ParseOverrideInput(profile, part, input))
+				{
+					reason = "override \"" + text + "\": each input is left_ or right_ and one of " + std::string(profile.controllerType) + "'s inputs on that hand";
+					return false;
+				}
+
+				if (press != Press::Click && (parts.size() > 1 || kind != ActionKind::Boolean || std::string(input.input->spelling.mode) != "button"))
+				{
+					reason = "override \"" + text + "\": a press type goes only on a button, for a boolean action, and never in a chord";
+					return false;
+				}
+
+				result.press = press;
+				result.inputs.push_back(input);
+			}
+
+			if (result.inputs.size() == 2)
+			{
+				bool sameInput = result.inputs[0].side == result.inputs[1].side && result.inputs[0].input == result.inputs[1].input;
+
+				if (kind != ActionKind::Boolean || sameInput || *result.inputs[0].input->spelling.booleanComponent == '\0' || *result.inputs[1].input->spelling.booleanComponent == '\0')
+				{
+					reason = "override \"" + text + "\": a chord is a boolean action on two different buttons";
+					return false;
+				}
+
+				return true;
+			}
+
+			if (ComponentForPress(result.inputs[0].input->spelling, kind, result.press).empty())
+			{
+				reason = "override \"" + text + "\": that input takes no " + std::string(KindName(kind)) + " action";
+				return false;
+			}
+
+			return true;
 		}
 	}
 
+	std::vector<std::string> GetControllerTypes()
+	{
+		std::vector<std::string> types;
+
+		for (const ControllerProfile& profile : kProfiles)
+		{
+			types.push_back(profile.controllerType);
+		}
+
+		return types;
+	}
+
 	bool RegisterAction(const std::string& name, const std::string& kindText, const std::string& bindingText, const std::string& label, const std::string& setText, std::string& reason)
+	{
+		return RegisterAction(name, kindText, bindingText, label, setText, {}, reason);
+	}
+
+	bool RegisterAction(const std::string& name, const std::string& kindText, const std::string& bindingText, const std::string& label, const std::string& setText, const std::vector<std::pair<std::string, std::string>>& overrideTexts, std::string& reason)
 	{
 		ActionKind kind = ActionKind::Boolean;
 		Binding binding{};
@@ -1057,6 +1461,45 @@ namespace rcx::vr::input
 			return false;
 		}
 
+		std::vector<Override> overrides;
+
+		for (const auto& entry : overrideTexts)
+		{
+			const ControllerProfile* profile = nullptr;
+
+			for (const ControllerProfile& candidate : kProfiles)
+			{
+				if (entry.first == candidate.controllerType)
+				{
+					profile = &candidate;
+				}
+			}
+
+			if (profile == nullptr)
+			{
+				reason = "no controller type \"" + entry.first + "\" to override";
+				return false;
+			}
+
+			for (const Override& existing : overrides)
+			{
+				if (existing.controllerType == entry.first)
+				{
+					reason = "two overrides for " + entry.first;
+					return false;
+				}
+			}
+
+			Override override{};
+
+			if (!ParseOverride(*profile, entry.second, kind, override, reason))
+			{
+				return false;
+			}
+
+			overrides.push_back(override);
+		}
+
 		for (Action& action : actions)
 		{
 			if (action.name != name)
@@ -1065,11 +1508,18 @@ namespace rcx::vr::input
 			}
 
 			bool sameBinding = action.binding.side == binding.side && action.binding.slot == binding.slot && action.binding.press == binding.press && action.binding.chord == binding.chord;
+			bool sameOverrides = action.overrides.size() == overrides.size();
 
-			if (action.kind != kind || !sameBinding || action.label != label || action.set != set)
+			for (size_t index = 0; sameOverrides && index < overrides.size(); index++)
+			{
+				sameOverrides = action.overrides[index].controllerType == overrides[index].controllerType && action.overrides[index].text == overrides[index].text;
+			}
+
+			if (action.kind != kind || !sameBinding || !sameOverrides || action.label != label || action.set != set)
 			{
 				action.kind = kind;
 				action.binding = binding;
+				action.overrides = overrides;
 				action.label = label;
 				action.set = set;
 				action.value = ActionValue{name, kind};
@@ -1091,6 +1541,7 @@ namespace rcx::vr::input
 		action.set = set;
 		action.kind = kind;
 		action.binding = binding;
+		action.overrides = overrides;
 		action.value = ActionValue{name, kind};
 		actions.push_back(action);
 		manifestDirty = true;
@@ -1204,10 +1655,11 @@ namespace rcx::vr::input
 		return true;
 	}
 
-	void BeginSession(::vr::IVRInput* input, ::vr::IVRApplications* applications)
+	void BeginSession(::vr::IVRInput* input, ::vr::IVRApplications* applications, ::vr::IVRSystem* system)
 	{
 		Identify(applications);
 		vrInput = input;
+		vrSystem = system;
 		ResetHandles();
 		manifestDirty = true;
 	}
@@ -1215,6 +1667,7 @@ namespace rcx::vr::input
 	void EndSession()
 	{
 		vrInput = nullptr;
+		vrSystem = nullptr;
 		ResetHandles();
 		manifestDirty = true;
 	}
@@ -1365,10 +1818,47 @@ namespace rcx::vr::input
 		return true;
 	}
 
-	bool GetActionOrigins(const std::string& name, uint32_t& count, std::string& reason)
+	bool GetActionOrigins(const std::string& name, std::vector<ActionOrigin>& origins, std::string& reason)
 	{
-		count = 0;
+		origins.clear();
 
+		if (vrInput == nullptr || !setsReady)
+		{
+			reason = "no action sets: call SetActionSets first";
+			return false;
+		}
+
+		for (Action& action : actions)
+		{
+			if (action.name != name)
+			{
+				continue;
+			}
+
+			if (!action.originsRead && !ReadOrigins(action, reason))
+			{
+				return false;
+			}
+
+			origins = action.origins;
+			return true;
+		}
+
+		reason = "no action of that name";
+		return false;
+	}
+
+	void ForgetOrigins()
+	{
+		for (Action& action : actions)
+		{
+			action.originsRead = false;
+			action.origins.clear();
+		}
+	}
+
+	bool ShowActionOrigins(const std::string& name, std::string& reason)
+	{
 		if (vrInput == nullptr || !setsReady)
 		{
 			reason = "no action sets: call SetActionSets first";
@@ -1382,21 +1872,12 @@ namespace rcx::vr::input
 				continue;
 			}
 
-			::vr::VRInputValueHandle_t origins[::vr::k_unMaxActionOriginCount]{};
-			::vr::EVRInputError error = vrInput->GetActionOrigins(setHandles[action.set], action.handle, origins, ::vr::k_unMaxActionOriginCount);
+			::vr::EVRInputError error = vrInput->ShowActionOrigins(setHandles[action.set], action.handle);
 
 			if (error != ::vr::VRInputError_None)
 			{
-				reason = DescribeInputError("GetActionOrigins", error);
+				reason = DescribeInputError("ShowActionOrigins", error);
 				return false;
-			}
-
-			for (::vr::VRInputValueHandle_t origin : origins)
-			{
-				if (origin != ::vr::k_ulInvalidInputValueHandle)
-				{
-					count++;
-				}
 			}
 
 			return true;
@@ -1404,6 +1885,46 @@ namespace rcx::vr::input
 
 		reason = "no action of that name";
 		return false;
+	}
+
+	std::vector<int> MatchBindingInfo(const std::vector<std::string>& originHands, const std::vector<std::string>& bindingDevicePaths)
+	{
+		std::vector<int> matched(originHands.size(), -1);
+		std::vector<bool> used(bindingDevicePaths.size(), false);
+
+		for (size_t origin = 0; origin < originHands.size(); origin++)
+		{
+			if (originHands[origin].empty())
+			{
+				continue;
+			}
+
+			std::string path = "/user/hand/" + originHands[origin];
+
+			for (size_t binding = 0; binding < bindingDevicePaths.size(); binding++)
+			{
+				if (!used[binding] && bindingDevicePaths[binding] == path)
+				{
+					matched[origin] = static_cast<int>(binding);
+					used[binding] = true;
+					break;
+				}
+			}
+		}
+
+		if (originHands.size() == bindingDevicePaths.size())
+		{
+			for (size_t origin = 0; origin < originHands.size(); origin++)
+			{
+				if (matched[origin] < 0 && !used[origin])
+				{
+					matched[origin] = static_cast<int>(origin);
+					used[origin] = true;
+				}
+			}
+		}
+
+		return matched;
 	}
 
 	bool WriteFilesForTest(std::string& reason)
