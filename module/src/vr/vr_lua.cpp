@@ -283,10 +283,14 @@ namespace rcx::vr
 		RCX_FUNCTION(EndTarget)
 		{
 			std::string reason;
+			std::string kind;
 
-			if (!rcx::vr::bridge::EndCapture(reason))
+			if (!rcx::vr::bridge::EndCapture(reason, kind))
 			{
-				return rcx::lua::PushFailure(lua, reason);
+				lua->PushNil();
+				lua->PushString(reason.c_str(), static_cast<unsigned int>(reason.size()));
+				lua->PushString(kind.c_str(), static_cast<unsigned int>(kind.size()));
+				return 3;
 			}
 
 			lua->PushBool(true);
@@ -501,6 +505,27 @@ namespace rcx::vr
 			lua->SetField(-2, "backend");
 			lua->PushString(stats.lastError.c_str());
 			lua->SetField(-2, "lastError");
+			lua->PushString(stats.capturedVia.c_str());
+			lua->SetField(-2, "capturedVia");
+			lua->PushString(stats.lastCaptureFailure.c_str());
+			lua->SetField(-2, "lastCaptureFailure");
+			lua->PushString(stats.hooks.c_str());
+			lua->SetField(-2, "hooks");
+			uint32_t limitWidth = 0;
+			uint32_t limitHeight = 0;
+			rcx::vr::bridge::GetTextureLimit(limitWidth, limitHeight);
+			SetNumber(lua, "textureLimitWidth", limitWidth);
+			SetNumber(lua, "textureLimitHeight", limitHeight);
+			int headsetAdapter = -1;
+			int gameAdapter = -1;
+			int adapterCount = 0;
+			rcx::vr::bridge::GetAdapters(headsetAdapter, gameAdapter, adapterCount);
+			SetNumber(lua, "headsetAdapter", headsetAdapter);
+			SetNumber(lua, "gameAdapter", gameAdapter);
+			SetNumber(lua, "adapterCount", adapterCount);
+			SetBool(lua, "gpuMismatchLikely", rcx::vr::bridge::GpuMismatchLikely());
+			lua->PushString(rcx::vr::bridge::DescribeAdapters().c_str());
+			lua->SetField(-2, "adapters");
 			return 1;
 		}
 
