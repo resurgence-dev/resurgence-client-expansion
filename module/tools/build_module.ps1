@@ -196,6 +196,46 @@ if (Test-Path $sysTest) {
 	}
 }
 
+# The x64 detour on hand-written functions; a failure fails the build.
+$detourTest = Join-Path $testsDir "rcx_detour_test.exe"
+if (Test-Path $detourTest) {
+	& $detourTest
+	if ($LASTEXITCODE -ne 0) {
+		Write-Host "FAILED: rcx_detour_test" -ForegroundColor Red
+		exit 1
+	}
+}
+
+# VR-42: the VR bridge finds a device whose vtable an overlay copied; a failure fails the build.
+$vptrTest = Join-Path $testsDir "rcx_bridge_vptr_test.exe"
+if (Test-Path $vptrTest) {
+	& $vptrTest
+	if ($LASTEXITCODE -ne 0) {
+		Write-Host "FAILED: rcx_bridge_vptr_test" -ForegroundColor Red
+		exit 1
+	}
+}
+
+# The native path's Direct3D 9Ex to Direct3D 11 ordering without a CPU wait; a failure fails the build.
+$syncTest = Join-Path $testsDir "rcx_shared_sync_test.exe"
+if (Test-Path $syncTest) {
+	& $syncTest
+	if ($LASTEXITCODE -ne 0) {
+		Write-Host "FAILED: rcx_shared_sync_test" -ForegroundColor Red
+		exit 1
+	}
+}
+
+# The D3D12 hand-off for a game device on D3D9On12; a failure fails the build.
+$on12Test = Join-Path $testsDir "rcx_d3d9on12_test.exe"
+if (Test-Path $on12Test) {
+	& $on12Test
+	if ($LASTEXITCODE -ne 0) {
+		Write-Host "FAILED: rcx_d3d9on12_test" -ForegroundColor Red
+		exit 1
+	}
+}
+
 if ($Install) {
 	Write-Host "== Install into $luaBin" -ForegroundColor Cyan
 	if (-not (Test-CanReplace)) { exit 1 }

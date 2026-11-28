@@ -19,8 +19,19 @@ namespace rcx::core
 		std::string disabledReason;
 	};
 
-	// Thread safe. Lines are printed to the game console the next time Lua calls into the module.
+	// Thread safe. Lines are printed to the game console the next time Lua calls into the module, and written to
+	// the session log while one is open.
 	void Log(const char* format, ...);
+
+	/*
+		The VR session log (rcx 0.78): rcx_state\vr_last.log next to the DLL, overwritten at each VR start, so a
+		tester only ever has to send that file. Every Log line goes in, and LogToFile lines go only there (stats,
+		the hooks report, why VR stopped). Each line has the time, is flushed as it's written so a freeze or crash
+		leaves it on disk, and the file stops at kMaxSessionLogBytes with a note. version: the first line; path: where it is, UTF-8.
+	*/
+	bool OpenSessionLog(const char* version, std::string& path);
+	void CloseSessionLog();
+	void LogToFile(const char* format, ...);
 	std::vector<std::string> TakeLogLines();
 
 	void RegisterFeature(const char* name);

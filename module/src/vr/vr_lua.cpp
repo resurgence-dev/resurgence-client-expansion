@@ -469,6 +469,16 @@ namespace rcx::vr
 			return 1;
 		}
 
+		// rcx 0.79: SetSubmitWait(ms): how long the native path's Present waits for its copy; nil or negative for
+		// one headset frame, 0 for never (a frame late, as in 0.76-0.78).
+		RCX_FUNCTION(SetSubmitWait)
+		{
+			double milliseconds = lua->IsType(1, Type::Number) ? lua->GetNumber(1) : -1.0;
+			rcx::vr::bridge::SetSubmitWait(milliseconds);
+			lua->PushBool(true);
+			return 1;
+		}
+
 		RCX_FUNCTION(GetStats)
 		{
 			rcx::vr::bridge::Stats stats = rcx::vr::bridge::GetStats();
@@ -494,7 +504,26 @@ namespace rcx::vr
 			SetNumber(lua, "presentsWaitingForDraw", static_cast<double>(stats.presentsWaitingForDraw));
 			SetNumber(lua, "drawsWithoutSubmit", static_cast<double>(stats.drawsWithoutSubmit));
 			SetNumber(lua, "framesSkipped", static_cast<double>(stats.framesSkipped));
+			SetNumber(lua, "staleFrames", static_cast<double>(stats.staleFrames));
+			SetNumber(lua, "framesNotReady", static_cast<double>(stats.framesNotReady));
+			SetNumber(lua, "alreadySubmitted", static_cast<double>(stats.alreadySubmitted));
+			SetNumber(lua, "nestedPresents", static_cast<double>(stats.nestedPresents));
+			lua->PushString(stats.compositorAdapter.c_str());
+			lua->SetField(-2, "compositorAdapter");
 			SetNumber(lua, "waitTimeouts", static_cast<double>(stats.waitTimeouts));
+			SetNumber(lua, "submitWaitLimitMs", stats.submitWaitLimitMs);
+			SetNumber(lua, "lateSubmits", static_cast<double>(stats.lateSubmits));
+			SetNumber(lua, "presentsPerSecond", stats.presentsPerSecond);
+			SetNumber(lua, "submitsPerSecond", stats.submitsPerSecond);
+			SetNumber(lua, "waitsPerSecond", stats.waitsPerSecond);
+			rcx::vr::Pacing pacing = rcx::vr::GetPacing();
+			SetNumber(lua, "headsetHz", pacing.headsetHz);
+			SetNumber(lua, "waitPosesMs", pacing.waitPosesMs);
+			SetNumber(lua, "compositorFramesPerSecond", pacing.compositorFramesPerSecond);
+			SetNumber(lua, "reprojectedPerSecond", pacing.reprojectedPerSecond);
+			SetNumber(lua, "droppedPerSecond", pacing.droppedPerSecond);
+			SetNumber(lua, "throttledFrames", pacing.throttledFrames);
+			SetNumber(lua, "predictedFrames", pacing.predictedFrames);
 			SetNumber(lua, "resets", static_cast<double>(stats.resets));
 			SetNumber(lua, "lastWaitMs", stats.lastWaitMs);
 			SetNumber(lua, "maxWaitMs", stats.maxWaitMs);
@@ -526,6 +555,8 @@ namespace rcx::vr
 			SetBool(lua, "gpuMismatchLikely", rcx::vr::bridge::GpuMismatchLikely());
 			lua->PushString(rcx::vr::bridge::DescribeAdapters().c_str());
 			lua->SetField(-2, "adapters");
+			lua->PushString(rcx::vr::bridge::DetourReport().c_str());
+			lua->SetField(-2, "detours");
 			return 1;
 		}
 
@@ -1052,6 +1083,7 @@ namespace rcx::vr
 		SetFunction(lua, "GetControllerType", GetControllerType);
 		SetFunction(lua, "Submit", Submit);
 		SetFunction(lua, "GetStats", GetStats);
+		SetFunction(lua, "SetSubmitWait", SetSubmitWait);
 		SetFunction(lua, "RegisterAction", RegisterAction);
 		SetFunction(lua, "SetActionSets", SetActionSets);
 		SetFunction(lua, "GetActions", GetActions);

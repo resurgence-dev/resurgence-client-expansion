@@ -10,10 +10,15 @@
 
 #include <windows.h>
 #include <d3d9.h>
+#include <d3d12.h>
+#include <d3d9on12.h>
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <dxgi.h>
 
 #include "core/core.h"
+#include "core/detour.h"
+#include "engine/engine_guard.h"
 #include "vr/dxvk_interop.h"
 
 namespace rcx::vr::bridge
@@ -30,7 +35,8 @@ namespace rcx::vr::bridge
 
 		constexpr size_t kMaxQueuedSubmits = 3;
 		constexpr double kWaitTimeoutMs = 100.0;
-		constexpr int kCopyCount = 2;
+		// Three, so the native path can have two copies in flight on the GPU while a third is written.
+		constexpr int kCopyCount = 3;
 
 		using Direct3DCreate9ExFunction = HRESULT(WINAPI*)(UINT, IDirect3D9Ex**);
 		using Direct3DCreate9Function = IDirect3D9*(WINAPI*)(UINT);
@@ -56,6 +62,7 @@ namespace rcx::vr::bridge
 			Unknown,
 			Vulkan,
 			Shared,
+			D3D12,
 			Failed
 		};
 
@@ -67,6 +74,8 @@ namespace rcx::vr::bridge
 					return "dxvk vulkan interop";
 				case Backend::Shared:
 					return "d3d11 shared texture";
+				case Backend::D3D12:
+					return "d3d12 through d3d9on12";
 				case Backend::Failed:
 					return "failed";
 				default:
@@ -74,12 +83,19 @@ namespace rcx::vr::bridge
 			}
 		}
 
+		// wait: the compositor wait (NoteWait's count) the frame was rendered for. With mat_queue_mode 2 the
+		// render thread presents a frame behind, so a frame is usually submitted in the next wait; one two or
+		// more waits behind is dropped as stale.
 		struct PendingFrame
 		{
 			uint32_t frameId = 0;
+			uint64_t wait = 0;
 			::vr::HmdMatrix34_t headPose{};
 		};
 
+		// The native path's copies (rcx 0.76): a copy is written and its event query issued at a Present, which
+		// since 0.79 waits a bounded time for it; one not done by then is submitted at a later Present.
+		// pending: written, not yet submitted or dropped; sequence orders the copies; frame is its pose.
 		struct CopyTexture
 		{
 			IDirect3DTexture9* texture = nullptr;
@@ -87,6 +103,15 @@ namespace rcx::vr::bridge
 			HANDLE handle = nullptr;
 			ID3D11Texture2D* compositorTexture = nullptr;
 			dxvk::ID3D9VkInteropTexture* interopTexture = nullptr;
+			IDirect3DQuery9* query = nullptr;
+			// The D3D12 path: a command allocator and list for its two barriers, and the fence value after its last use.
+			ID3D12CommandAllocator* allocator = nullptr;
+			ID3D12GraphicsCommandList* list = nullptr;
+			uint64_t fenceDone = 0;
+			bool pending = false;
+			uint64_t sequence = 0;
+			PendingFrame frame{};
+			std::chrono::steady_clock::time_point written{};
 		};
 
 		/*
@@ -131,6 +156,19 @@ namespace rcx::vr::bridge
 
 		// Set while a hooked device Present runs, so a swap chain Present it calls inside isn't counted twice.
 		thread_local bool insideDevicePresent = false;
+		thread_local bool insideReset = false;
+
+		// rcx 0.74: the d3d9.dll function bodies are detoured (vr_detours, crash-latched) when the
+		// feature is on; a vtable slot is patched only where its body couldn't be detoured.
+		bool detoursActive = false;
+		std::string detoursOff;
+		std::vector<std::string> detourReport;
+		int detoursInstalled = 0;
+		int detoursChained = 0;
+		int detoursRefused = 0;
+
+		// The module the game device's vtable lives in, once found ("d3d9.dll", an overlay, or none: a heap copy).
+		std::string gameVptrOwner;
 
 		void HookVtable(IDirect3DDevice9* device, bool ex, const std::string& label);
 
@@ -141,9 +179,26 @@ namespace rcx::vr::bridge
 		// adapter the headset wants (IVRSystem::GetD3D9AdapterIndex) and the game's device's own
 		// (GetCreationParameters), -1 until known.
 		std::vector<std::string> adapterNames;
+		// Each adapter's GPU (its LUID, else vendor and device ids): Direct3D 9 has an adapter per monitor
+		// output, so two adapters can be one GPU.
+		std::vector<std::string> adapterGpus;
 		std::atomic<int> headsetAdapter{-1};
 		std::atomic<int> gameAdapter{-1};
 		constexpr UINT kMaxAdapters = 4;
+		constexpr const char* kDetourFeature = "vr_detours";
+		constexpr const char* kScanFeature = "vr_device_scan";
+
+		// How the game's device was found: "" (not yet), "its Present" or the scan's place in shaderapidx9.dll.
+		std::string deviceFoundBy;
+
+		// The detours' latch is disarmed once this many presents have run through the hooks (NoteWait checks).
+		constexpr uint64_t kCleanPresents = 600;
+		std::atomic<uint64_t> presentCount{0};
+		bool detoursArmed = false;
+
+		// D3D9On12: whether the game's device runs on it, and its Direct3D 12 device's GPU (DescribeHooks fills it).
+		std::string gameOn12;
+		std::string scanResult;
 
 		const HookedVtable& TableFor(const void* device)
 		{
@@ -221,6 +276,7 @@ namespace rcx::vr::bridge
 		std::atomic<uint64_t> queuedDropped{0};
 		std::atomic<uint64_t> presentsWaitingForDraw{0};
 		std::atomic<uint64_t> waitCount{0};
+		std::atomic<uint64_t> nestedPresents{0};
 
 		// The captured eye texture. Written by the CreateTexture and Reset hooks.
 		std::mutex captureMutex;
@@ -235,7 +291,9 @@ namespace rcx::vr::bridge
 		TextureBounds bounds[2] = {{0.0f, 0.0f, 0.5f, 1.0f}, {0.5f, 0.0f, 1.0f, 1.0f}};
 
 		// The device thread's side. Lua takes it only in EndSession.
-		std::mutex deviceMutex;
+		// Timed, so the Lua thread never waits forever for a render thread stuck in a driver call (kLuaLockLimit).
+		std::timed_mutex deviceMutex;
+		constexpr std::chrono::milliseconds kLuaLockLimit{2000};
 		::vr::IVRCompositor* compositor = nullptr;
 		int32_t adapterIndex = -1;
 		Backend backend = Backend::Unknown;
@@ -245,10 +303,40 @@ namespace rcx::vr::bridge
 		ID3D11DeviceContext* compositorContext = nullptr;
 		dxvk::ID3D9VkInteropDevice* interopDevice = nullptr;
 		CopyTexture copies[kCopyCount]{};
-		IDirect3DQuery9* drawQuery = nullptr;
+		uint64_t copySequence = 0;
+
+		// The D3D12 path (rcx 0.78): the game's device on D3D9On12, its Direct3D 12 device, a queue of ours on it
+		// and a fence. deviceMutex held.
+		IDirect3DDevice9On12* on12Device = nullptr;
+		ID3D12Device* device12 = nullptr;
+		ID3D12CommandQueue* queue12 = nullptr;
+		ID3D12Fence* fence12 = nullptr;
+		uint64_t fenceValue = 0;
+
+		// The render thread's watchdog: a hand-off to SteamVR slower than kSlowSubmitMs for kSlowSubmitFrames
+		// frames in a row stops VR (Tripped), rather than letting the game crawl into a freeze.
+		constexpr double kSlowSubmitMs = 100.0;
+		constexpr int kSlowSubmitFrames = 10;
+		int slowSubmits = 0;
+		std::atomic<bool> tripped{false};
+		std::mutex tripMutex;
+		std::string tripReason;
+		std::atomic<uint64_t> submittedCount{0};
 		uint32_t copiesGeneration = 0;
 		int nextCopy = 0;
 		uint64_t lastSubmittedWait = 0;
+
+		// The native path's wait at a Present (SetSubmitWait): asked (negative for one headset frame) and the
+		// headset's frame time read at BeginSession.
+		constexpr double kMaxSubmitWaitMs = 50.0;
+		std::atomic<double> askedSubmitWaitMs{-1.0};
+		double headsetFrameMs = 1000.0 / 90.0;
+
+		// The pacing rates' window (OnPresent, deviceMutex held).
+		std::chrono::steady_clock::time_point rateWindowStart{};
+		uint64_t rateWindowPresents = 0;
+		uint64_t rateWindowSubmits = 0;
+		uint64_t rateWindowWaits = 0;
 		Stats stats{};
 
 		std::mutex statsMutex;
@@ -331,17 +419,41 @@ namespace rcx::vr::bridge
 		// deviceMutex held, device thread. The interop device goes with the copies, so the backend is chosen again.
 		void ReleaseDeviceResources()
 		{
+			if (fence12 != nullptr && fence12->GetCompletedValue() < fenceValue)
+			{
+				HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+				if (event != nullptr && SUCCEEDED(fence12->SetEventOnCompletion(fenceValue, event)))
+				{
+					WaitForSingleObject(event, 500);
+				}
+
+				if (event != nullptr)
+				{
+					CloseHandle(event);
+				}
+			}
+
 			for (CopyTexture& copy : copies)
 			{
+				SafeRelease(copy.list);
+				SafeRelease(copy.allocator);
+				copy.fenceDone = 0;
 				SafeRelease(copy.compositorTexture);
 				SafeRelease(copy.interopTexture);
 				SafeRelease(copy.surface);
 				SafeRelease(copy.texture);
+				SafeRelease(copy.query);
 				copy.handle = nullptr;
+				copy.pending = false;
 			}
 
-			SafeRelease(drawQuery);
 			SafeRelease(interopDevice);
+			SafeRelease(fence12);
+			SafeRelease(queue12);
+			SafeRelease(device12);
+			SafeRelease(on12Device);
+			fenceValue = 0;
 
 			if (backend != Backend::Failed)
 			{
@@ -370,10 +482,98 @@ namespace rcx::vr::bridge
 			return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 		}
 
+		// The headset's DXGI adapter (SteamVR's GetDXGIOutputInfo): its LUID and name, false when unknown.
+		bool HeadsetAdapter(LUID& luid, std::string& name)
+		{
+			if (adapterIndex < 0)
+			{
+				return false;
+			}
+
+			HMODULE dxgi = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+			auto createFactory = dxgi != nullptr ? reinterpret_cast<CreateDXGIFactory1Function>(reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1"))) : nullptr;
+			IDXGIFactory1* factory = nullptr;
+			bool known = false;
+
+			if (createFactory != nullptr && SUCCEEDED(createFactory(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory != nullptr)
+			{
+				IDXGIAdapter1* adapter = nullptr;
+
+				if (SUCCEEDED(factory->EnumAdapters1(static_cast<UINT>(adapterIndex), &adapter)) && adapter != nullptr)
+				{
+					DXGI_ADAPTER_DESC1 description{};
+
+					if (SUCCEEDED(adapter->GetDesc1(&description)))
+					{
+						luid = description.AdapterLuid;
+						char narrow[256]{};
+						WideCharToMultiByte(CP_UTF8, 0, description.Description, -1, narrow, sizeof(narrow) - 1, nullptr, nullptr);
+						name = narrow;
+						known = true;
+					}
+
+					adapter->Release();
+				}
+
+				factory->Release();
+			}
+
+			return known;
+		}
+
+		// deviceMutex held, device thread. For a game device on D3D9On12: its Direct3D 12 device, a direct queue
+		// and a fence, and the D3D12 backend; false (backend unchanged) when the device isn't on D3D9On12, false
+		// with the backend failed when its GPU isn't the headset's or setup fails.
+		bool ChooseD3D12(IDirect3DDevice9* device)
+		{
+			if (FAILED(device->QueryInterface(__uuidof(IDirect3DDevice9On12), reinterpret_cast<void**>(&on12Device))) || on12Device == nullptr)
+			{
+				on12Device = nullptr;
+				return false;
+			}
+
+			if (FAILED(on12Device->GetD3D12Device(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device12))) || device12 == nullptr)
+			{
+				device12 = nullptr;
+				SafeRelease(on12Device);
+				return false;
+			}
+
+			LUID gameLuid = device12->GetAdapterLuid();
+			std::string gameName = DxgiAdapterName(gameLuid);
+			LUID headsetLuid{};
+			std::string headsetName = "unknown";
+			bool headsetKnown = HeadsetAdapter(headsetLuid, headsetName);
+			stats.compositorAdapter = "Direct3D 12 through D3D9On12 on " + gameName + "; the headset's DXGI adapter " + std::to_string(adapterIndex) + " (" + headsetName + ")";
+
+			if (headsetKnown && (headsetLuid.LowPart != gameLuid.LowPart || headsetLuid.HighPart != gameLuid.HighPart))
+			{
+				Fail("the game draws on " + gameName + " (Direct3D 9 on D3D9On12) but SteamVR's headset is on " + headsetName + ", so every eye frame would cross "
+					"graphics cards. Set gmod.exe (garrysmod\\bin\\win64\\gmod.exe) to High performance in Windows Settings > System > Display > Graphics, or in "
+					"the NVIDIA or AMD control panel, so it runs on the headset's card, then restart the game");
+				return false;
+			}
+
+			D3D12_COMMAND_QUEUE_DESC queueDescription{};
+			queueDescription.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+
+			if (FAILED(device12->CreateCommandQueue(&queueDescription, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&queue12))) || queue12 == nullptr ||
+				FAILED(device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence12))) || fence12 == nullptr)
+			{
+				Fail("can't create a Direct3D 12 queue or fence on D3D9On12's device");
+				return false;
+			}
+
+			fenceValue = 0;
+			backend = Backend::D3D12;
+			rcx::core::Log("vr: the game runs on D3D9On12; submitting its Direct3D 12 resources (%s)", stats.compositorAdapter.c_str());
+			return true;
+		}
+
 		// deviceMutex held, device thread.
 		bool ChooseBackend(IDirect3DDevice9* device)
 		{
-			if (backend == Backend::Vulkan || backend == Backend::Shared)
+			if (backend == Backend::Vulkan || backend == Backend::Shared || backend == Backend::D3D12)
 			{
 				return true;
 			}
@@ -395,13 +595,84 @@ namespace rcx::vr::bridge
 			}
 
 			interopDevice = nullptr;
+
+			if (ChooseD3D12(device))
+			{
+				return true;
+			}
+
+			if (backend == Backend::Failed)
+			{
+				return false;
+			}
+
+			// As on DXVK: otherwise WaitGetPoses, on the Lua thread, does the handoff on the Direct3D 11 context while
+			// this thread submits on it, and both hang in the driver (rcx 0.79, VR-42).
+			compositor->SetExplicitTimingMode(::vr::VRCompositorTimingMode_Explicit_ApplicationPerformsPostPresentHandoff);
 			backend = Backend::Shared;
 			rcx::core::Log("vr: native Direct3D 9; submitting through a Direct3D 11 shared texture");
 			return true;
 		}
 
-		// deviceMutex held.
-		bool EnsureCompositorDevice()
+		std::string Narrow(const wchar_t* text)
+		{
+			char narrow[256]{};
+			WideCharToMultiByte(CP_UTF8, 0, text, -1, narrow, sizeof(narrow) - 1, nullptr, nullptr);
+			return narrow;
+		}
+
+		// When the device runs on D3D9On12, the LUID of the GPU its Direct3D 12 device is on (else false).
+		bool D3D12AdapterLuid(IDirect3DDevice9* device, LUID& luid)
+		{
+			IDirect3DDevice9On12* on12 = nullptr;
+
+			if (FAILED(device->QueryInterface(__uuidof(IDirect3DDevice9On12), reinterpret_cast<void**>(&on12))) || on12 == nullptr)
+			{
+				return false;
+			}
+
+			ID3D12Device* d3d12 = nullptr;
+			bool known = SUCCEEDED(on12->GetD3D12Device(__uuidof(ID3D12Device), reinterpret_cast<void**>(&d3d12))) && d3d12 != nullptr;
+
+			if (known)
+			{
+				luid = d3d12->GetAdapterLuid();
+				d3d12->Release();
+			}
+
+			on12->Release();
+			return known;
+		}
+
+		// The game device's adapter: its name, and its LUID when the runtime is Direct3D 9Ex (else false).
+		bool GameAdapterLuid(IDirect3DDevice9* device, LUID& luid, std::string& name)
+		{
+			D3DDEVICE_CREATION_PARAMETERS creation{};
+			IDirect3D9* direct3d = nullptr;
+
+			if (FAILED(device->GetCreationParameters(&creation)) || FAILED(device->GetDirect3D(&direct3d)) || direct3d == nullptr)
+			{
+				return false;
+			}
+
+			D3DADAPTER_IDENTIFIER9 identifier{};
+
+			if (SUCCEEDED(direct3d->GetAdapterIdentifier(creation.AdapterOrdinal, 0, &identifier)))
+			{
+				name = identifier.Description;
+			}
+
+			IDirect3D9Ex* direct3dEx = nullptr;
+			bool known = SUCCEEDED(direct3d->QueryInterface(__uuidof(IDirect3D9Ex), reinterpret_cast<void**>(&direct3dEx))) && direct3dEx != nullptr &&
+				SUCCEEDED(direct3dEx->GetAdapterLUID(creation.AdapterOrdinal, &luid));
+			SafeRelease(direct3dEx);
+			direct3d->Release();
+			return known;
+		}
+
+		// deviceMutex held. On the headset's adapter (SteamVR's GetDXGIOutputInfo), which must be the GPU the
+		// game's device draws on: a shared texture between two GPUs is slow or broken, so that's refused.
+		bool EnsureCompositorDevice(IDirect3DDevice9* device)
 		{
 			if (compositorDevice != nullptr)
 			{
@@ -436,12 +707,74 @@ namespace rcx::vr::bridge
 			IDXGIFactory1* factory = nullptr;
 			IDXGIAdapter1* adapter = nullptr;
 
-			if (adapterIndex >= 0 && SUCCEEDED(createFactory(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory != nullptr)
+			if (SUCCEEDED(createFactory(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory != nullptr && adapterIndex >= 0)
 			{
 				if (FAILED(factory->EnumAdapters1(static_cast<UINT>(adapterIndex), &adapter)))
 				{
 					adapter = nullptr;
 				}
+			}
+
+			LUID gameLuid{};
+			std::string gameName = "unknown";
+			bool gameKnown = GameAdapterLuid(device, gameLuid, gameName);
+			LUID on12Luid{};
+			bool on12 = D3D12AdapterLuid(device, on12Luid);
+
+			// On D3D9On12 the GPU that draws is its Direct3D 12 device's, whatever Direct3D 9's adapter says.
+			if (on12)
+			{
+				gameLuid = on12Luid;
+				gameKnown = true;
+			}
+			std::string headsetName = "unknown";
+			bool sameGpu = true;
+			int gameDxgiIndex = -1;
+
+			if (adapter != nullptr)
+			{
+				DXGI_ADAPTER_DESC1 description{};
+
+				if (SUCCEEDED(adapter->GetDesc1(&description)))
+				{
+					headsetName = Narrow(description.Description);
+					sameGpu = !gameKnown || (description.AdapterLuid.LowPart == gameLuid.LowPart && description.AdapterLuid.HighPart == gameLuid.HighPart);
+				}
+			}
+
+			if (gameKnown && factory != nullptr)
+			{
+				IDXGIAdapter1* candidate = nullptr;
+
+				for (UINT index = 0; gameDxgiIndex < 0 && SUCCEEDED(factory->EnumAdapters1(index, &candidate)); index++)
+				{
+					DXGI_ADAPTER_DESC1 description{};
+
+					if (SUCCEEDED(candidate->GetDesc1(&description)) && description.AdapterLuid.LowPart == gameLuid.LowPart && description.AdapterLuid.HighPart == gameLuid.HighPart)
+					{
+						gameDxgiIndex = static_cast<int>(index);
+
+						if (on12)
+						{
+							gameName = Narrow(description.Description) + " (through D3D9On12's Direct3D 12 device)";
+						}
+					}
+
+					SafeRelease(candidate);
+				}
+			}
+
+			stats.compositorAdapter = "the headset's DXGI adapter " + std::to_string(adapterIndex) + " (" + headsetName + "); the game's Direct3D 9 device on " + gameName +
+				(gameKnown ? " (DXGI adapter " + std::to_string(gameDxgiIndex) + ")" : " (its LUID unknown: not a Direct3D 9Ex runtime)");
+
+			if (!sameGpu)
+			{
+				SafeRelease(adapter);
+				SafeRelease(factory);
+				Fail("the game draws on " + gameName + " but SteamVR's headset is on " + headsetName + ", so every eye frame would cross graphics cards. Set gmod.exe "
+					"(garrysmod\\bin\\win64\\gmod.exe) to High performance in Windows Settings > System > Display > Graphics, or in the NVIDIA or AMD control panel, "
+					"so it runs on the headset's card, then restart the game");
+				return false;
 			}
 
 			D3D_DRIVER_TYPE driverType = adapter != nullptr ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;
@@ -457,7 +790,16 @@ namespace rcx::vr::bridge
 				return false;
 			}
 
-			rcx::core::Log("vr: Direct3D 11 device ready on adapter %d", adapterIndex);
+			// SteamVR uses the context from whichever thread calls it, so the context locks itself.
+			ID3D11Multithread* multithread = nullptr;
+
+			if (SUCCEEDED(compositorContext->QueryInterface(__uuidof(ID3D11Multithread), reinterpret_cast<void**>(&multithread))) && multithread != nullptr)
+			{
+				multithread->SetMultithreadProtected(TRUE);
+				multithread->Release();
+			}
+
+			rcx::core::Log("vr: Direct3D 11 device ready on %s", stats.compositorAdapter.c_str());
 			return true;
 		}
 
@@ -560,22 +902,25 @@ namespace rcx::vr::bridge
 
 			if (backend == Backend::Shared)
 			{
-				if (!EnsureCompositorDevice())
+				if (!EnsureCompositorDevice(device))
 				{
 					return false;
 				}
 
-				if (drawQuery == nullptr && FAILED(device->CreateQuery(D3DQUERYTYPE_EVENT, &drawQuery)))
+				for (CopyTexture& copy : copies)
 				{
-					drawQuery = nullptr;
-					Fail("the device can't create an event query");
-					return false;
+					if (copy.query == nullptr && FAILED(device->CreateQuery(D3DQUERYTYPE_EVENT, &copy.query)))
+					{
+						copy.query = nullptr;
+						Fail("the device can't create an event query");
+						return false;
+					}
 				}
 			}
 
 			for (CopyTexture& copy : copies)
 			{
-				if (copy.texture != nullptr && (backend == Backend::Vulkan || copy.compositorTexture != nullptr))
+				if (copy.texture != nullptr && (backend != Backend::Shared || copy.compositorTexture != nullptr))
 				{
 					continue;
 				}
@@ -612,6 +957,28 @@ namespace rcx::vr::bridge
 					{
 						copy.interopTexture = nullptr;
 						Fail("the copy texture has no DXVK interop interface (" + HresultText(result) + ")");
+						return false;
+					}
+				}
+				else if (backend == Backend::D3D12)
+				{
+					HRESULT result = device->CreateTexture(sourceDescription.Width, sourceDescription.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8,
+						D3DPOOL_DEFAULT, &copy.texture, nullptr);
+
+					if (FAILED(result) || copy.texture == nullptr)
+					{
+						copy.texture = nullptr;
+						Fail("can't create the copy texture (" + HresultText(result) + ")");
+						return false;
+					}
+
+					bool listed = SUCCEEDED(device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), reinterpret_cast<void**>(&copy.allocator)))
+						&& copy.allocator != nullptr && SUCCEEDED(device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, copy.allocator, nullptr,
+						__uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void**>(&copy.list))) && copy.list != nullptr && SUCCEEDED(copy.list->Close());
+
+					if (!listed)
+					{
+						Fail("can't create the Direct3D 12 command list for a copy");
 						return false;
 					}
 				}
@@ -655,12 +1022,30 @@ namespace rcx::vr::bridge
 				if (error != ::vr::VRCompositorError_None)
 				{
 					stats.submitErrors++;
+					stats.alreadySubmitted += error == ::vr::VRCompositorError_AlreadySubmitted ? 1 : 0;
 					stats.lastCompositorError = static_cast<int>(error);
 					SetError("compositor submit error " + std::to_string(static_cast<int>(error)));
 					return false;
 				}
 			}
 
+			return true;
+		}
+
+		// deviceMutex held, device thread. Takes the current compositor wait for this submit, or false when a
+		// submit already took it. A frame drawn for an earlier wait than the one it takes counts as late.
+		bool ClaimWait(const PendingFrame& frame)
+		{
+			uint64_t waits = waitCount.load();
+
+			if (waits == lastSubmittedWait)
+			{
+				stats.framesSkipped++;
+				return false;
+			}
+
+			lastSubmittedWait = waits;
+			stats.lateSubmits += frame.wait < waits ? 1 : 0;
 			return true;
 		}
 
@@ -708,6 +1093,12 @@ namespace rcx::vr::bridge
 			texture.eColorSpace = ::vr::ColorSpace_Gamma;
 			texture.mDeviceToAbsoluteTracking = frame.headPose;
 
+			// Claimed before the layout change, so a refused claim leaves the image as it was.
+			if (!ClaimWait(frame))
+			{
+				return;
+			}
+
 			auto flushStart = std::chrono::steady_clock::now();
 			interopDevice->TransitionTextureLayout(copy.interopTexture, &range, layout, dxvk::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 			interopDevice->FlushRenderingCommands();
@@ -736,40 +1127,70 @@ namespace rcx::vr::bridge
 			}
 		}
 
-		// deviceMutex held, device thread.
-		void SubmitShared(CopyTexture& copy, const PendingFrame& frame)
+		// deviceMutex held, device thread. Submits the newest copy the GPU has finished (older ones it
+		// supersedes are dropped), never waiting: a copy not done yet stays for the next Present.
+		void SubmitFinishedShared()
 		{
-			auto waitStart = std::chrono::steady_clock::now();
-			drawQuery->Issue(D3DISSUE_END);
-			bool done = false;
+			int best = -1;
 
-			while (!done)
+			for (int index = 0; index < kCopyCount; index++)
 			{
-				HRESULT queryResult = drawQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH);
+				CopyTexture& copy = copies[index];
 
-				if (queryResult == S_OK)
+				if (!copy.pending || copy.query == nullptr)
 				{
-					done = true;
-					break;
+					continue;
 				}
 
-				if (queryResult != S_FALSE || MillisecondsSince(waitStart) > kWaitTimeoutMs)
+				HRESULT result = copy.query->GetData(nullptr, 0, D3DGETDATA_FLUSH);
+
+				if (result == S_FALSE)
 				{
-					break;
+					continue;
 				}
 
-				YieldProcessor();
+				if (result != S_OK)
+				{
+					// A lost device or a failed query: the copy can't be trusted.
+					copy.pending = false;
+					stats.submitErrors++;
+					continue;
+				}
+
+				if (best < 0 || copy.sequence > copies[best].sequence)
+				{
+					best = index;
+				}
 			}
 
-			stats.lastWaitMs = MillisecondsSince(waitStart);
+			if (best < 0)
+			{
+				return;
+			}
+
+			for (CopyTexture& copy : copies)
+			{
+				if (copy.pending && copy.sequence < copies[best].sequence)
+				{
+					copy.pending = false;
+					stats.staleFrames++;
+				}
+			}
+
+			CopyTexture& copy = copies[best];
+			copy.pending = false;
+			stats.lastWaitMs = MillisecondsSince(copy.written);
 			stats.maxWaitMs = stats.lastWaitMs > stats.maxWaitMs ? stats.lastWaitMs : stats.maxWaitMs;
 			stats.averageWaitMs = stats.framesSubmitted == 0 ? stats.lastWaitMs : stats.averageWaitMs * 0.95 + stats.lastWaitMs * 0.05;
 
-			if (!done)
+			if (copy.frame.wait + 1 < waitCount.load())
 			{
-				stats.waitTimeouts++;
-				stats.submitErrors++;
-				SetError("the eye draws didn't finish within the wait limit");
+				stats.staleFrames++;
+				return;
+			}
+
+			if (!ClaimWait(copy.frame))
+			{
 				return;
 			}
 
@@ -777,16 +1198,222 @@ namespace rcx::vr::bridge
 			texture.handle = copy.compositorTexture;
 			texture.eType = ::vr::TextureType_DirectX;
 			texture.eColorSpace = ::vr::ColorSpace_Gamma;
-			texture.mDeviceToAbsoluteTracking = frame.headPose;
+			texture.mDeviceToAbsoluteTracking = copy.frame.headPose;
 
 			auto submitStart = std::chrono::steady_clock::now();
 
 			if (SubmitEyes(texture, ::vr::Submit_TextureWithPose))
 			{
+				compositor->PostPresentHandoff();
+				compositor->SubmitExplicitTimingData();
 				stats.framesSubmitted++;
 			}
 
 			stats.lastSubmitMs = MillisecondsSince(submitStart);
+		}
+
+		// The native path's wait at a Present now: one headset frame unless SetSubmitWait asked otherwise.
+		double SubmitWaitLimitMs()
+		{
+			double asked = askedSubmitWaitMs.load();
+			double limit = asked < 0.0 ? headsetFrameMs : asked;
+			return limit > kMaxSubmitWaitMs ? kMaxSubmitWaitMs : limit;
+		}
+
+		/*
+			deviceMutex held, device thread. The native path at a Present: copy this frame into a free copy and
+			mark it with an event query, wait up to SubmitWaitLimitMs for the GPU to finish it (Direct3D 11 can't
+			wait for Direct3D 9's work itself), then submit the newest finished copy. A copy not done in time
+			(waitTimeouts) goes out at a later Present, a frame late. With every copy still in flight the oldest is
+			overwritten (framesNotReady). lastWaitMs is how long the copy took to be seen finished.
+		*/
+		void PipelineShared(IDirect3DDevice9* device, const PendingFrame& frame)
+		{
+			int slot = -1;
+
+			for (int index = 0; index < kCopyCount && slot < 0; index++)
+			{
+				if (!copies[index].pending)
+				{
+					slot = index;
+				}
+			}
+
+			if (slot < 0)
+			{
+				slot = 0;
+
+				for (int index = 1; index < kCopyCount; index++)
+				{
+					slot = copies[index].sequence < copies[slot].sequence ? index : slot;
+				}
+
+				copies[slot].pending = false;
+				stats.framesNotReady++;
+			}
+
+			CopyTexture& copy = copies[slot];
+			HRESULT copyResult = device->StretchRect(eyeSurface.load(), nullptr, copy.surface, nullptr, D3DTEXF_NONE);
+
+			if (FAILED(copyResult))
+			{
+				stats.submitErrors++;
+				SetError("can't copy the eye texture (" + HresultText(copyResult) + ")");
+				return;
+			}
+
+			copy.query->Issue(D3DISSUE_END);
+			copy.frame = frame;
+			copy.sequence = ++copySequence;
+			copy.written = std::chrono::steady_clock::now();
+			copy.pending = true;
+
+			double limit = SubmitWaitLimitMs();
+			stats.submitWaitLimitMs = limit;
+
+			if (limit > 0.0)
+			{
+				HRESULT state = copy.query->GetData(nullptr, 0, D3DGETDATA_FLUSH);
+
+				while (state == S_FALSE && MillisecondsSince(copy.written) < limit)
+				{
+					SwitchToThread();
+					state = copy.query->GetData(nullptr, 0, D3DGETDATA_FLUSH);
+				}
+
+				stats.waitTimeouts += state == S_FALSE ? 1 : 0;
+			}
+
+			SubmitFinishedShared();
+		}
+
+		// Records one transition of resource and runs it on queue12 (the copy's list and allocator, reset by the caller).
+		bool RunBarrier(CopyTexture& copy, ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+		{
+			if (FAILED(copy.list->Reset(copy.allocator, nullptr)))
+			{
+				return false;
+			}
+
+			D3D12_RESOURCE_BARRIER barrier{};
+			barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barrier.Transition.pResource = resource;
+			barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			barrier.Transition.StateBefore = before;
+			barrier.Transition.StateAfter = after;
+			copy.list->ResourceBarrier(1, &barrier);
+
+			if (FAILED(copy.list->Close()))
+			{
+				return false;
+			}
+
+			ID3D12CommandList* lists[] = {copy.list};
+			queue12->ExecuteCommandLists(1, lists);
+			return true;
+		}
+
+		/*
+			deviceMutex held, device thread. The D3D12 path: copy the eye into a copy whose last use the GPU has
+			finished (else skip, framesNotReady), take the copy's Direct3D 12 resource from D3D9On12 against our
+			queue (D3D9On12 makes the queue wait for its own work on it; it comes back in COMMON), make it a shader
+			resource, submit it with that queue, make it COMMON again, signal the fence and give it back with that
+			fence value. The CPU never waits for the GPU.
+		*/
+		void SubmitD3D12(IDirect3DDevice9* device, const PendingFrame& frame)
+		{
+			uint64_t waits = waitCount.load();
+
+			if (frame.wait + 1 < waits)
+			{
+				stats.staleFrames++;
+				return;
+			}
+
+			if (waits == lastSubmittedWait)
+			{
+				stats.framesSkipped++;
+				return;
+			}
+
+			uint64_t completed = fence12->GetCompletedValue();
+			int slot = -1;
+
+			for (int step = 0; step < kCopyCount && slot < 0; step++)
+			{
+				int index = (nextCopy + step) % kCopyCount;
+				slot = copies[index].fenceDone <= completed ? index : -1;
+			}
+
+			if (slot < 0)
+			{
+				stats.framesNotReady++;
+				return;
+			}
+
+			nextCopy = (slot + 1) % kCopyCount;
+			CopyTexture& copy = copies[slot];
+			HRESULT result = device->StretchRect(eyeSurface.load(), nullptr, copy.surface, nullptr, D3DTEXF_NONE);
+
+			if (FAILED(result))
+			{
+				stats.submitErrors++;
+				SetError("can't copy the eye texture (" + HresultText(result) + ")");
+				return;
+			}
+
+			ID3D12Resource* resource = nullptr;
+			result = on12Device->UnwrapUnderlyingResource(copy.texture, queue12, __uuidof(ID3D12Resource), reinterpret_cast<void**>(&resource));
+
+			if (FAILED(result) || resource == nullptr)
+			{
+				stats.submitErrors++;
+				SetError("D3D9On12 wouldn't give the copy's Direct3D 12 resource (" + HresultText(result) + ")");
+				return;
+			}
+
+			bool ready = SUCCEEDED(copy.allocator->Reset()) && RunBarrier(copy, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+			if (ready && ClaimWait(frame))
+			{
+				::vr::D3D12TextureData_t data{};
+				data.m_pResource = resource;
+				data.m_pCommandQueue = queue12;
+				data.m_nNodeMask = 0;
+
+				::vr::VRTextureWithPose_t texture{};
+				texture.handle = &data;
+				texture.eType = ::vr::TextureType_DirectX12;
+				texture.eColorSpace = ::vr::ColorSpace_Gamma;
+				texture.mDeviceToAbsoluteTracking = frame.headPose;
+
+				auto submitStart = std::chrono::steady_clock::now();
+
+				if (SubmitEyes(texture, ::vr::Submit_TextureWithPose))
+				{
+					stats.framesSubmitted++;
+				}
+
+				stats.lastSubmitMs = MillisecondsSince(submitStart);
+			}
+			else if (!ready)
+			{
+				stats.submitErrors++;
+				SetError("can't record the Direct3D 12 barrier for the copy");
+			}
+
+			if (ready)
+			{
+				RunBarrier(copy, resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+			}
+
+			fenceValue++;
+			queue12->Signal(fence12, fenceValue);
+			copy.fenceDone = fenceValue;
+			ID3D12Fence* fences[] = {fence12};
+			UINT64 values[] = {fenceValue};
+			on12Device->ReturnUnderlyingResource(copy.texture, 1, values, fences);
+			resource->Release();
 		}
 
 		// deviceMutex held, device thread.
@@ -798,16 +1425,33 @@ namespace rcx::vr::bridge
 				return;
 			}
 
-			// The render thread can fall a frame behind the Lua thread; a second submit after one wait is refused (AlreadySubmitted).
+			if (backend == Backend::Shared)
+			{
+				PipelineShared(device, frame);
+				return;
+			}
+
+			if (backend == Backend::D3D12)
+			{
+				SubmitD3D12(device, frame);
+				return;
+			}
+
+			// One submit per compositor wait (a second is AlreadySubmitted): skip early when this wait has one
+			// already; the wait is claimed right before the submit itself (ClaimWait).
 			uint64_t waits = waitCount.load();
+
+			if (frame.wait + 1 < waits)
+			{
+				stats.staleFrames++;
+				return;
+			}
 
 			if (waits == lastSubmittedWait)
 			{
 				stats.framesSkipped++;
 				return;
 			}
-
-			lastSubmittedWait = waits;
 
 			CopyTexture& copy = copies[nextCopy];
 			nextCopy = (nextCopy + 1) % kCopyCount;
@@ -821,20 +1465,14 @@ namespace rcx::vr::bridge
 				return;
 			}
 
-			if (backend == Backend::Vulkan)
-			{
-				SubmitVulkan(copy, frame);
-			}
-			else
-			{
-				SubmitShared(copy, frame);
-			}
+			SubmitVulkan(copy, frame);
 		}
 
 		void OnPresent(IDirect3DDevice9* device, bool isEx)
 		{
 			if (insideBridge)
 			{
+				nestedPresents++;
 				return;
 			}
 
@@ -855,7 +1493,31 @@ namespace rcx::vr::bridge
 
 				int table = TableIndexFor(device);
 
-				if (table < 0 && known == device)
+				if (known == device && deviceFoundBy.empty())
+				{
+					deviceFoundBy = "its Present";
+				}
+
+				if (known == device)
+				{
+					void* vptr = *reinterpret_cast<void**>(device);
+					HMODULE owner = nullptr;
+					DWORD ownerFlags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+					char ownerPath[MAX_PATH]{};
+
+					if (GetModuleHandleExW(ownerFlags, reinterpret_cast<LPCWSTR>(vptr), &owner) && GetModuleFileNameA(owner, ownerPath, MAX_PATH) > 0)
+					{
+						std::string path(ownerPath);
+						size_t slash = path.find_last_of("\\/");
+						gameVptrOwner = slash == std::string::npos ? path : path.substr(slash + 1);
+					}
+					else
+					{
+						gameVptrOwner = "no module (a copy on the heap)";
+					}
+				}
+
+				if (table < 0 && known == device && !detoursActive)
 				{
 					// Found through its swap chain on a vtable no throwaway had: patch the device's own.
 					IDirect3DDevice9Ex* probe = nullptr;
@@ -912,8 +1574,25 @@ namespace rcx::vr::bridge
 				}
 			}
 
-			std::lock_guard<std::mutex> lock(deviceMutex);
+			std::lock_guard<std::timed_mutex> lock(deviceMutex);
 			stats.presents++;
+			presentCount++;
+			auto now = std::chrono::steady_clock::now();
+			double windowSeconds = std::chrono::duration<double>(now - rateWindowStart).count();
+
+			if (windowSeconds >= 1.0)
+			{
+				bool first = rateWindowStart == std::chrono::steady_clock::time_point{} || windowSeconds > 5.0;
+				uint64_t waits = waitCount.load();
+				stats.presentsPerSecond = first ? 0.0 : (stats.presents - rateWindowPresents) / windowSeconds;
+				stats.submitsPerSecond = first ? 0.0 : (stats.framesSubmitted - rateWindowSubmits) / windowSeconds;
+				stats.waitsPerSecond = first ? 0.0 : (waits - rateWindowWaits) / windowSeconds;
+				rateWindowStart = now;
+				rateWindowPresents = stats.presents;
+				rateWindowSubmits = stats.framesSubmitted;
+				rateWindowWaits = waits;
+			}
+
 			stats.deviceIsEx = stats.deviceIsEx || isEx;
 			stats.presentOnOtherThread = GetCurrentThreadId() != luaThreadId;
 
@@ -924,9 +1603,25 @@ namespace rcx::vr::bridge
 				backendFailed = false;
 			}
 
-			if (haveFrame)
+			if (haveFrame && !tripped.load())
 			{
+				auto handOffStart = std::chrono::steady_clock::now();
+				uint64_t before = stats.framesSubmitted;
 				SubmitFrame(device, frame);
+				double handOffMs = MillisecondsSince(handOffStart);
+				submittedCount += stats.framesSubmitted - before;
+				slowSubmits = handOffMs > kSlowSubmitMs ? slowSubmits + 1 : 0;
+
+				if (slowSubmits >= kSlowSubmitFrames)
+				{
+					char text[256]{};
+					std::snprintf(text, sizeof(text), "handing each frame to SteamVR took over %.0f ms for %d frames in a row (the last %.0f ms, on %s), so VR was stopped before the "
+						"game froze", kSlowSubmitMs, kSlowSubmitFrames, handOffMs, BackendName(backend));
+					std::lock_guard<std::mutex> tripLock(tripMutex);
+					tripReason = text;
+					tripped = true;
+					SetError(text);
+				}
 			}
 			else if (sessionActive.load() && drawn)
 			{
@@ -946,7 +1641,7 @@ namespace rcx::vr::bridge
 			BridgeScope scope;
 
 			{
-				std::lock_guard<std::mutex> lock(deviceMutex);
+				std::lock_guard<std::timed_mutex> lock(deviceMutex);
 				ReleaseDeviceResources();
 				backend = Backend::Unknown;
 				backendFailed = false;
@@ -981,8 +1676,13 @@ namespace rcx::vr::bridge
 			return presentObserver.load();
 		}
 
-		HRESULT STDMETHODCALLTYPE HookPresent(IDirect3DDevice9* device, const RECT* sourceRect, const RECT* destinationRect, HWND window, const RGNDATA* dirtyRegion)
+		HRESULT DoPresent(PresentFunction original, IDirect3DDevice9* device, const RECT* sourceRect, const RECT* destinationRect, HWND window, const RGNDATA* dirtyRegion)
 		{
+			if (insideDevicePresent)
+			{
+				return original(device, sourceRect, destinationRect, window, dirtyRegion);
+			}
+
 			OnPresent(device, false);
 			const PresentObserver* observer = ObserverFor(device);
 
@@ -993,7 +1693,7 @@ namespace rcx::vr::bridge
 
 			bool outer = insideDevicePresent;
 			insideDevicePresent = true;
-			HRESULT result = TableFor(device).present(device, sourceRect, destinationRect, window, dirtyRegion);
+			HRESULT result = original(device, sourceRect, destinationRect, window, dirtyRegion);
 			insideDevicePresent = outer;
 
 			if (observer != nullptr)
@@ -1004,8 +1704,14 @@ namespace rcx::vr::bridge
 			return result;
 		}
 
-		HRESULT STDMETHODCALLTYPE HookPresentEx(IDirect3DDevice9Ex* device, const RECT* sourceRect, const RECT* destinationRect, HWND window, const RGNDATA* dirtyRegion, DWORD flags)
+		HRESULT DoPresentEx(PresentExFunction original, IDirect3DDevice9Ex* device, const RECT* sourceRect, const RECT* destinationRect, HWND window, const RGNDATA* dirtyRegion,
+			DWORD flags)
 		{
+			if (insideDevicePresent)
+			{
+				return original(device, sourceRect, destinationRect, window, dirtyRegion, flags);
+			}
+
 			OnPresent(device, true);
 			const PresentObserver* observer = ObserverFor(device);
 
@@ -1016,7 +1722,7 @@ namespace rcx::vr::bridge
 
 			bool outer = insideDevicePresent;
 			insideDevicePresent = true;
-			HRESULT result = TableFor(device).presentEx(device, sourceRect, destinationRect, window, dirtyRegion, flags);
+			HRESULT result = original(device, sourceRect, destinationRect, window, dirtyRegion, flags);
 			insideDevicePresent = outer;
 
 			if (observer != nullptr)
@@ -1027,21 +1733,9 @@ namespace rcx::vr::bridge
 			return result;
 		}
 
-		HRESULT STDMETHODCALLTYPE HookSwapChainPresent(IDirect3DSwapChain9* chain, const RECT* sourceRect, const RECT* destinationRect, HWND window, const RGNDATA* dirtyRegion,
-			DWORD flags)
+		HRESULT DoSwapChainPresent(SwapChainPresentFunction original, IDirect3DSwapChain9* chain, const RECT* sourceRect, const RECT* destinationRect, HWND window,
+			const RGNDATA* dirtyRegion, DWORD flags)
 		{
-			void** vtable = *reinterpret_cast<void***>(chain);
-			SwapChainPresentFunction original = swapChains[0].present;
-			int count = swapChainCount.load();
-
-			for (int index = 0; index < count; index++)
-			{
-				if (swapChains[index].vtable == vtable)
-				{
-					original = swapChains[index].present;
-				}
-			}
-
 			IDirect3DDevice9* device = nullptr;
 
 			if (insideDevicePresent || insideBridge || FAILED(chain->GetDevice(&device)) || device == nullptr)
@@ -1070,8 +1764,13 @@ namespace rcx::vr::bridge
 			return result;
 		}
 
-		HRESULT STDMETHODCALLTYPE HookReset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* parameters)
+		HRESULT DoReset(ResetFunction original, IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* parameters)
 		{
+			if (insideReset)
+			{
+				return original(device, parameters);
+			}
+
 			OnReset(device);
 			const PresentObserver* observer = ObserverFor(device);
 
@@ -1080,11 +1779,19 @@ namespace rcx::vr::bridge
 				observer->onReset(device);
 			}
 
-			return TableFor(device).reset(device, parameters);
+			insideReset = true;
+			HRESULT result = original(device, parameters);
+			insideReset = false;
+			return result;
 		}
 
-		HRESULT STDMETHODCALLTYPE HookResetEx(IDirect3DDevice9Ex* device, D3DPRESENT_PARAMETERS* parameters, D3DDISPLAYMODEEX* displayMode)
+		HRESULT DoResetEx(ResetExFunction original, IDirect3DDevice9Ex* device, D3DPRESENT_PARAMETERS* parameters, D3DDISPLAYMODEEX* displayMode)
 		{
+			if (insideReset)
+			{
+				return original(device, parameters, displayMode);
+			}
+
 			OnReset(device);
 			const PresentObserver* observer = ObserverFor(device);
 
@@ -1093,7 +1800,10 @@ namespace rcx::vr::bridge
 				observer->onReset(device);
 			}
 
-			return TableFor(device).resetEx(device, parameters, displayMode);
+			insideReset = true;
+			HRESULT result = original(device, parameters, displayMode);
+			insideReset = false;
+			return result;
 		}
 
 		// Takes a render target texture as the eye texture. via: how it was seen, "creation" or "binding".
@@ -1149,7 +1859,7 @@ namespace rcx::vr::bridge
 			CaptureEye(texture, surface, desc.Width, desc.Height, static_cast<uint32_t>(desc.Format), "binding");
 		}
 
-		HRESULT STDMETHODCALLTYPE HookSetRenderTarget(IDirect3DDevice9* device, DWORD index, IDirect3DSurface9* surface)
+		HRESULT DoSetRenderTarget(SetRenderTargetFunction original, IDirect3DDevice9* device, DWORD index, IDirect3DSurface9* surface)
 		{
 			if (index == 0 && surface != nullptr && !insideBridge)
 			{
@@ -1163,13 +1873,13 @@ namespace rcx::vr::bridge
 				}
 			}
 
-			return TableFor(device).setRenderTarget(device, index, surface);
+			return original(device, index, surface);
 		}
 
-		HRESULT STDMETHODCALLTYPE HookCreateTexture(IDirect3DDevice9* device, UINT width, UINT height, UINT levels, DWORD usage, D3DFORMAT format,
+		HRESULT DoCreateTexture(CreateTextureFunction original, IDirect3DDevice9* device, UINT width, UINT height, UINT levels, DWORD usage, D3DFORMAT format,
 			D3DPOOL pool, IDirect3DTexture9** texture, HANDLE* sharedHandle)
 		{
-			HRESULT result = TableFor(device).createTexture(device, width, height, levels, usage, format, pool, texture, sharedHandle);
+			HRESULT result = original(device, width, height, levels, usage, format, pool, texture, sharedHandle);
 
 			if (!insideBridge && (usage & D3DUSAGE_RENDERTARGET) != 0 && (captureArmed.load() || recaptureArmed.load()))
 			{
@@ -1227,6 +1937,140 @@ namespace rcx::vr::bridge
 			CaptureEye(*texture, surface, width, height, static_cast<uint32_t>(format), "creation");
 			return result;
 		}
+
+		// The vtable route: a patched slot calls the original of the device's own table.
+		HRESULT STDMETHODCALLTYPE HookPresent(IDirect3DDevice9* device, const RECT* sourceRect, const RECT* destinationRect, HWND window, const RGNDATA* dirtyRegion)
+		{
+			return DoPresent(TableFor(device).present, device, sourceRect, destinationRect, window, dirtyRegion);
+		}
+
+		HRESULT STDMETHODCALLTYPE HookPresentEx(IDirect3DDevice9Ex* device, const RECT* sourceRect, const RECT* destinationRect, HWND window, const RGNDATA* dirtyRegion, DWORD flags)
+		{
+			return DoPresentEx(TableFor(device).presentEx, device, sourceRect, destinationRect, window, dirtyRegion, flags);
+		}
+
+		HRESULT STDMETHODCALLTYPE HookSwapChainPresent(IDirect3DSwapChain9* chain, const RECT* sourceRect, const RECT* destinationRect, HWND window, const RGNDATA* dirtyRegion,
+			DWORD flags)
+		{
+			void** vtable = *reinterpret_cast<void***>(chain);
+			SwapChainPresentFunction original = swapChains[0].present;
+			int count = swapChainCount.load();
+
+			for (int index = 0; index < count; index++)
+			{
+				if (swapChains[index].vtable == vtable)
+				{
+					original = swapChains[index].present;
+				}
+			}
+
+			return DoSwapChainPresent(original, chain, sourceRect, destinationRect, window, dirtyRegion, flags);
+		}
+
+		HRESULT STDMETHODCALLTYPE HookReset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* parameters)
+		{
+			return DoReset(TableFor(device).reset, device, parameters);
+		}
+
+		HRESULT STDMETHODCALLTYPE HookResetEx(IDirect3DDevice9Ex* device, D3DPRESENT_PARAMETERS* parameters, D3DDISPLAYMODEEX* displayMode)
+		{
+			return DoResetEx(TableFor(device).resetEx, device, parameters, displayMode);
+		}
+
+		HRESULT STDMETHODCALLTYPE HookSetRenderTarget(IDirect3DDevice9* device, DWORD index, IDirect3DSurface9* surface)
+		{
+			return DoSetRenderTarget(TableFor(device).setRenderTarget, device, index, surface);
+		}
+
+		HRESULT STDMETHODCALLTYPE HookCreateTexture(IDirect3DDevice9* device, UINT width, UINT height, UINT levels, DWORD usage, D3DFORMAT format,
+			D3DPOOL pool, IDirect3DTexture9** texture, HANDLE* sharedHandle)
+		{
+			return DoCreateTexture(TableFor(device).createTexture, device, width, height, levels, usage, format, pool, texture, sharedHandle);
+		}
+
+		/*
+			The detour route: each distinct d3d9.dll body of a function gets its own entry point (index I)
+			and trampoline, so a device whose vtable is a copy (an overlay's) still reaches the hooks
+			through the body it calls.
+		*/
+		constexpr int kMaxBodies = 8;
+
+		struct DetourSet
+		{
+			const char* name = "";
+			void* bodies[kMaxBodies]{};
+			void* trampolines[kMaxBodies]{};
+			bool installed[kMaxBodies]{};
+			int count = 0;
+		};
+
+		DetourSet presentDetours{"Present"};
+		DetourSet presentExDetours{"PresentEx"};
+		DetourSet swapChainPresentDetours{"the swap chain's Present"};
+		DetourSet resetDetours{"Reset"};
+		DetourSet resetExDetours{"ResetEx"};
+		DetourSet setRenderTargetDetours{"SetRenderTarget"};
+		DetourSet createTextureDetours{"CreateTexture"};
+
+		template <int I>
+		HRESULT STDMETHODCALLTYPE DetourPresent(IDirect3DDevice9* device, const RECT* sourceRect, const RECT* destinationRect, HWND window, const RGNDATA* dirtyRegion)
+		{
+			return DoPresent(reinterpret_cast<PresentFunction>(presentDetours.trampolines[I]), device, sourceRect, destinationRect, window, dirtyRegion);
+		}
+
+		template <int I>
+		HRESULT STDMETHODCALLTYPE DetourPresentEx(IDirect3DDevice9Ex* device, const RECT* sourceRect, const RECT* destinationRect, HWND window, const RGNDATA* dirtyRegion, DWORD flags)
+		{
+			return DoPresentEx(reinterpret_cast<PresentExFunction>(presentExDetours.trampolines[I]), device, sourceRect, destinationRect, window, dirtyRegion, flags);
+		}
+
+		template <int I>
+		HRESULT STDMETHODCALLTYPE DetourSwapChainPresent(IDirect3DSwapChain9* chain, const RECT* sourceRect, const RECT* destinationRect, HWND window, const RGNDATA* dirtyRegion,
+			DWORD flags)
+		{
+			return DoSwapChainPresent(reinterpret_cast<SwapChainPresentFunction>(swapChainPresentDetours.trampolines[I]), chain, sourceRect, destinationRect, window, dirtyRegion,
+				flags);
+		}
+
+		template <int I>
+		HRESULT STDMETHODCALLTYPE DetourReset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* parameters)
+		{
+			return DoReset(reinterpret_cast<ResetFunction>(resetDetours.trampolines[I]), device, parameters);
+		}
+
+		template <int I>
+		HRESULT STDMETHODCALLTYPE DetourResetEx(IDirect3DDevice9Ex* device, D3DPRESENT_PARAMETERS* parameters, D3DDISPLAYMODEEX* displayMode)
+		{
+			return DoResetEx(reinterpret_cast<ResetExFunction>(resetExDetours.trampolines[I]), device, parameters, displayMode);
+		}
+
+		template <int I>
+		HRESULT STDMETHODCALLTYPE DetourSetRenderTarget(IDirect3DDevice9* device, DWORD index, IDirect3DSurface9* surface)
+		{
+			return DoSetRenderTarget(reinterpret_cast<SetRenderTargetFunction>(setRenderTargetDetours.trampolines[I]), device, index, surface);
+		}
+
+		template <int I>
+		HRESULT STDMETHODCALLTYPE DetourCreateTexture(IDirect3DDevice9* device, UINT width, UINT height, UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool,
+			IDirect3DTexture9** texture, HANDLE* sharedHandle)
+		{
+			return DoCreateTexture(reinterpret_cast<CreateTextureFunction>(createTextureDetours.trampolines[I]), device, width, height, levels, usage, format, pool, texture,
+				sharedHandle);
+		}
+
+#define RCX_DETOUR_ENTRIES(entry) \
+	{reinterpret_cast<void*>(&entry<0>), reinterpret_cast<void*>(&entry<1>), reinterpret_cast<void*>(&entry<2>), reinterpret_cast<void*>(&entry<3>), \
+		reinterpret_cast<void*>(&entry<4>), reinterpret_cast<void*>(&entry<5>), reinterpret_cast<void*>(&entry<6>), reinterpret_cast<void*>(&entry<7>)}
+
+		void* const presentEntries[kMaxBodies] = RCX_DETOUR_ENTRIES(DetourPresent);
+		void* const presentExEntries[kMaxBodies] = RCX_DETOUR_ENTRIES(DetourPresentEx);
+		void* const swapChainPresentEntries[kMaxBodies] = RCX_DETOUR_ENTRIES(DetourSwapChainPresent);
+		void* const resetEntries[kMaxBodies] = RCX_DETOUR_ENTRIES(DetourReset);
+		void* const resetExEntries[kMaxBodies] = RCX_DETOUR_ENTRIES(DetourResetEx);
+		void* const setRenderTargetEntries[kMaxBodies] = RCX_DETOUR_ENTRIES(DetourSetRenderTarget);
+		void* const createTextureEntries[kMaxBodies] = RCX_DETOUR_ENTRIES(DetourCreateTexture);
+
+#undef RCX_DETOUR_ENTRIES
 	}
 
 	namespace
@@ -1253,6 +2097,68 @@ namespace rcx::vr::bridge
 			std::string text(path, length);
 			size_t slash = text.find_last_of("\\/");
 			return slash == std::string::npos ? text : text.substr(slash + 1);
+		}
+
+		// "d3d9.dll+0x1a2b0" for an address in a module, else the bare address.
+		std::string DescribeAddress(const void* address)
+		{
+			HMODULE module = nullptr;
+			DWORD flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+			char text[64]{};
+
+			if (GetModuleHandleExW(flags, reinterpret_cast<LPCWSTR>(address), &module))
+			{
+				std::snprintf(text, sizeof(text), "+0x%llx", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(module)));
+				return ModuleNameOf(address) + text;
+			}
+
+			std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(address)));
+			return text;
+		}
+
+		// Detours one body of a function once; true when it's detoured (now or before), false when it
+		// was refused or the set is full, so the caller patches the vtable slot instead.
+		bool DetourBody(DetourSet& set, void* const* entries, void* body)
+		{
+			if (!detoursActive || body == nullptr)
+			{
+				return false;
+			}
+
+			for (int index = 0; index < set.count; index++)
+			{
+				if (set.bodies[index] == body)
+				{
+					return set.installed[index];
+				}
+			}
+
+			if (set.count >= kMaxBodies)
+			{
+				return false;
+			}
+
+			int index = set.count;
+			set.bodies[index] = body;
+			set.count = index + 1;
+			std::string how;
+			std::string reason;
+			set.installed[index] = rcx::detour::Install(body, entries[index], &set.trampolines[index], how, reason);
+			std::string line = std::string(set.name) + " at " + DescribeAddress(body) + ": " + (set.installed[index] ? how : "refused, " + reason + "; its vtable slots are patched instead");
+			detourReport.push_back(line);
+			rcx::core::Log("vr: %s", line.c_str());
+
+			if (set.installed[index])
+			{
+				detoursInstalled++;
+				detoursChained += how.find("chained") != std::string::npos ? 1 : 0;
+			}
+			else
+			{
+				detoursRefused++;
+			}
+
+			return set.installed[index];
 		}
 
 		// Patches a throwaway device's vtable unless one before it had the same. ex: the device is an
@@ -1300,16 +2206,42 @@ namespace rcx::vr::bridge
 
 			vtableCount = count + 1;
 
-			void* unused = nullptr;
-			bool patched = PatchSlot(vtable, kSlotCreateTexture, reinterpret_cast<void*>(&HookCreateTexture), &unused)
-				&& PatchSlot(vtable, kSlotSetRenderTarget, reinterpret_cast<void*>(&HookSetRenderTarget), &unused)
-				&& PatchSlot(vtable, kSlotReset, reinterpret_cast<void*>(&HookReset), &unused)
-				&& PatchSlot(vtable, kSlotPresent, reinterpret_cast<void*>(&HookPresent), &unused);
-
-			if (patched && ex)
+			// Each slot is caught by detouring its body, or else by patching the slot.
+			struct SlotHook
 			{
-				patched = PatchSlot(vtable, kSlotResetEx, reinterpret_cast<void*>(&HookResetEx), &unused)
-					&& PatchSlot(vtable, kSlotPresentEx, reinterpret_cast<void*>(&HookPresentEx), &unused);
+				int slot;
+				void* hook;
+				DetourSet* set;
+				void* const* entries;
+			};
+
+			const SlotHook slots[] = {
+				{kSlotCreateTexture, reinterpret_cast<void*>(&HookCreateTexture), &createTextureDetours, createTextureEntries},
+				{kSlotSetRenderTarget, reinterpret_cast<void*>(&HookSetRenderTarget), &setRenderTargetDetours, setRenderTargetEntries},
+				{kSlotReset, reinterpret_cast<void*>(&HookReset), &resetDetours, resetEntries},
+				{kSlotPresent, reinterpret_cast<void*>(&HookPresent), &presentDetours, presentEntries},
+				{kSlotResetEx, reinterpret_cast<void*>(&HookResetEx), &resetExDetours, resetExEntries},
+				{kSlotPresentEx, reinterpret_cast<void*>(&HookPresentEx), &presentExDetours, presentExEntries},
+			};
+
+			void* unused = nullptr;
+			bool patched = true;
+
+			for (const SlotHook& entry : slots)
+			{
+				bool exSlot = entry.slot == kSlotResetEx || entry.slot == kSlotPresentEx;
+
+				if (exSlot && !ex)
+				{
+					continue;
+				}
+
+				if (DetourBody(*entry.set, entry.entries, vtable[entry.slot]))
+				{
+					continue;
+				}
+
+				patched = PatchSlot(vtable, entry.slot, entry.hook, &unused) && patched;
 			}
 
 			rcx::core::Log("vr: %s the %s device's vtable (its functions in %s)", patched ? "hooked" : "couldn't fully hook", label.c_str(), table.owner.c_str());
@@ -1345,7 +2277,8 @@ namespace rcx::vr::bridge
 			swapChainCount = count + 1;
 
 			void* unused = nullptr;
-			bool patched = PatchSlot(vtable, kSlotSwapChainPresent, reinterpret_cast<void*>(&HookSwapChainPresent), &unused);
+			bool patched = DetourBody(swapChainPresentDetours, swapChainPresentEntries, vtable[kSlotSwapChainPresent])
+				|| PatchSlot(vtable, kSlotSwapChainPresent, reinterpret_cast<void*>(&HookSwapChainPresent), &unused);
 			rcx::core::Log("vr: %s the %s device's swap chain Present (in %s)", patched ? "hooked" : "couldn't hook", label.c_str(),
 				ModuleNameOf(reinterpret_cast<const void*>(swapChains[count].present)).c_str());
 		}
@@ -1415,6 +2348,291 @@ namespace rcx::vr::bridge
 
 			return found;
 		}
+
+		// Every loaded module as (lowercase file name, full path).
+		std::vector<std::pair<std::string, std::string>> LoadedModules()
+		{
+			std::vector<std::pair<std::string, std::string>> found;
+			auto enumModules = reinterpret_cast<EnumProcessModulesFunction>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32EnumProcessModules")));
+			static HMODULE modules[1024];
+			DWORD needed = 0;
+
+			if (enumModules == nullptr || !enumModules(GetCurrentProcess(), modules, sizeof(modules), &needed))
+			{
+				return found;
+			}
+
+			for (DWORD index = 0; index < needed / sizeof(HMODULE) && index < 1024; index++)
+			{
+				char path[MAX_PATH]{};
+				DWORD length = GetModuleFileNameA(modules[index], path, MAX_PATH);
+
+				if (length == 0 || length >= MAX_PATH)
+				{
+					continue;
+				}
+
+				std::string full(path, length);
+				size_t slash = full.find_last_of("\\/");
+				std::string name = slash == std::string::npos ? full : full.substr(slash + 1);
+
+				for (char& character : name)
+				{
+					character = static_cast<char>(tolower(static_cast<unsigned char>(character)));
+				}
+
+				found.emplace_back(name, full);
+			}
+
+			return found;
+		}
+
+		// A cached VirtualQuery: whether [address, address + size) is committed, readable memory, and whether it's
+		// executable code of a loaded image.
+		struct MemoryCheck
+		{
+			struct Region
+			{
+				uintptr_t start = 0;
+				uintptr_t end = 0;
+				bool readable = false;
+				bool imageCode = false;
+			};
+
+			std::vector<Region> regions;
+
+			const Region* Find(uintptr_t address)
+			{
+				for (const Region& region : regions)
+				{
+					if (address >= region.start && address < region.end)
+					{
+						return &region;
+					}
+				}
+
+				MEMORY_BASIC_INFORMATION info{};
+
+				if (address < 0x10000 || address > 0x7fffffffffffULL || VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == 0)
+				{
+					return nullptr;
+				}
+
+				DWORD protect = info.Protect & 0xff;
+				bool committed = info.State == MEM_COMMIT && (info.Protect & PAGE_GUARD) == 0 && protect != PAGE_NOACCESS;
+				bool executable = protect == PAGE_EXECUTE_READ || protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
+				Region region{};
+				region.start = reinterpret_cast<uintptr_t>(info.BaseAddress);
+				region.end = region.start + info.RegionSize;
+				region.readable = committed && protect != PAGE_EXECUTE;
+				region.imageCode = committed && executable && info.Type == MEM_IMAGE;
+
+				if (regions.size() > 4096)
+				{
+					regions.clear();
+				}
+
+				regions.push_back(region);
+				return &regions.back();
+			}
+
+			bool Readable(uintptr_t address, size_t size)
+			{
+				const Region* region = Find(address);
+				return region != nullptr && region->readable && address + size <= region->end;
+			}
+
+			bool ImageCode(uintptr_t address)
+			{
+				const Region* region = Find(address);
+				return region != nullptr && region->imageCode;
+			}
+		};
+
+		// IDirect3DDevice9's slot count: a candidate's vtable must have this many entries, all into code of a loaded image.
+		constexpr size_t kDeviceSlots = 119;
+	}
+
+	IDirect3DDevice9* ScanForDevice(void* module, std::string& where)
+	{
+		where.clear();
+
+		if (module == nullptr)
+		{
+			return nullptr;
+		}
+
+		const uint8_t* base = reinterpret_cast<const uint8_t*>(module);
+		const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+		{
+			return nullptr;
+		}
+
+		const IMAGE_NT_HEADERS64* headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+
+		if (headers->Signature != IMAGE_NT_SIGNATURE)
+		{
+			return nullptr;
+		}
+
+		const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(headers);
+		MemoryCheck memory;
+		int candidates = 0;
+
+		for (WORD index = 0; index < headers->FileHeader.NumberOfSections; index++, section++)
+		{
+			if ((section->Characteristics & IMAGE_SCN_MEM_WRITE) == 0)
+			{
+				continue;
+			}
+
+			uintptr_t start = reinterpret_cast<uintptr_t>(base + section->VirtualAddress);
+			size_t size = section->Misc.VirtualSize & ~static_cast<size_t>(7);
+
+			for (size_t offset = 0; offset + sizeof(uintptr_t) <= size; offset += sizeof(uintptr_t))
+			{
+				uintptr_t object = *reinterpret_cast<const uintptr_t*>(start + offset);
+
+				if ((object & 7) != 0 || !memory.Readable(object, sizeof(uintptr_t)))
+				{
+					continue;
+				}
+
+				uintptr_t table = *reinterpret_cast<const uintptr_t*>(object);
+
+				if ((table & 7) != 0 || !memory.Readable(table, kDeviceSlots * sizeof(uintptr_t)))
+				{
+					continue;
+				}
+
+				const uintptr_t* entries = reinterpret_cast<const uintptr_t*>(table);
+				bool allCode = true;
+
+				for (size_t slot = 0; slot < kDeviceSlots && allCode; slot++)
+				{
+					allCode = memory.ImageCode(entries[slot]);
+				}
+
+				if (!allCode)
+				{
+					continue;
+				}
+
+				// A COM object with a device-sized vtable in loaded code: ask it.
+				candidates++;
+				IUnknown* unknown = reinterpret_cast<IUnknown*>(object);
+				IDirect3DDevice9* device = nullptr;
+
+				if (SUCCEEDED(unknown->QueryInterface(__uuidof(IDirect3DDevice9), reinterpret_cast<void**>(&device))) && device != nullptr)
+				{
+					// The engine keeps its own reference; the bridge keeps none.
+					device->Release();
+					char text[96]{};
+					std::snprintf(text, sizeof(text), "+0x%llx, after %d candidate(s)", static_cast<unsigned long long>(start + offset - reinterpret_cast<uintptr_t>(base)), candidates);
+					where = ModuleNameOf(base) + text;
+					return device;
+				}
+			}
+		}
+
+		where = "not found in " + ModuleNameOf(base) + " (" + std::to_string(candidates) + " COM object(s) with a device-sized vtable asked)";
+		return nullptr;
+	}
+
+	namespace
+	{
+		// Finds the game's device in shaderapidx9.dll's data, independent of any hook, and hooks its own vtable.
+		void FindGameDevice()
+		{
+			std::string why;
+
+			if (rcx::core::IsFeatureDisabled(kScanFeature, &why))
+			{
+				scanResult = "off: " + why;
+				return;
+			}
+
+			HMODULE shaderApi = GetModuleHandleW(L"shaderapidx9.dll");
+
+			if (shaderApi == nullptr)
+			{
+				scanResult = "shaderapidx9.dll isn't loaded";
+				return;
+			}
+
+			if (!rcx::engine::Arm(kScanFeature))
+			{
+				scanResult = "off: the crash latch couldn't be armed";
+				return;
+			}
+
+			std::string where;
+			IDirect3DDevice9* device = ScanForDevice(shaderApi, where);
+			scanResult = where;
+
+			if (device == nullptr)
+			{
+				rcx::engine::Disarm(kScanFeature);
+				rcx::core::Log("vr: the game's device wasn't found by the scan: %s", where.c_str());
+				return;
+			}
+
+			AdoptGameDevice(device, "the scan of " + where);
+			rcx::engine::Disarm(kScanFeature);
+		}
+	}
+
+	void AdoptGameDevice(IDirect3DDevice9* device, const std::string& how)
+	{
+		IDirect3DDevice9* known = nullptr;
+		bool adopted = gameDevice.compare_exchange_strong(known, device);
+
+		if (!adopted && known != device)
+		{
+			rcx::core::Log("vr: %s found a device, but another one already presented through the hooks; kept that one", how.c_str());
+			return;
+		}
+
+		if (deviceFoundBy.empty() || deviceFoundBy == "its Present")
+		{
+			deviceFoundBy = adopted ? how : deviceFoundBy + " (and " + how + ")";
+		}
+
+		D3DCAPS9 caps{};
+
+		if (maxTextureWidth.load() == 0 && SUCCEEDED(device->GetDeviceCaps(&caps)))
+		{
+			maxTextureWidth = caps.MaxTextureWidth;
+			maxTextureHeight = caps.MaxTextureHeight;
+		}
+
+		D3DDEVICE_CREATION_PARAMETERS creation{};
+
+		if (SUCCEEDED(device->GetCreationParameters(&creation)))
+		{
+			gameAdapter = static_cast<int>(creation.AdapterOrdinal);
+		}
+
+		void* vptr = *reinterpret_cast<void**>(device);
+		std::string owner = ModuleNameOf(vptr);
+		gameVptrOwner = owner == "unknown" ? "no module (a copy on the heap)" : owner;
+		IDirect3DDevice9Ex* probe = nullptr;
+		bool ex = false;
+
+		if (SUCCEEDED(device->QueryInterface(__uuidof(IDirect3DDevice9Ex), reinterpret_cast<void**>(&probe))) && probe != nullptr)
+		{
+			ex = true;
+			probe->Release();
+		}
+
+		// Its own table: each slot's body is detoured if it isn't yet, else the slot is patched.
+		HookVtable(device, ex, "the game's own");
+		int table = TableIndexFor(device);
+		gameVtable = table;
+		rcx::core::Log("vr: found the game's Direct3D 9 device by %s; its vtable is in %s, its functions in %s", how.c_str(), gameVptrOwner.c_str(),
+			table >= 0 ? vtables[table].owner.c_str() : "unknown");
 	}
 
 	bool InstallHooks(std::string& reason)
@@ -1445,6 +2663,24 @@ namespace rcx::vr::bridge
 		{
 			reason = "can't create a window for the throwaway device";
 			return false;
+		}
+
+		// The detours are behind vr_detours: the policy file, the player's rcx_vr_detours and the crash
+		// latch (armed before the first write) can each keep them off, and then only vtables are patched.
+		std::string detoursReason;
+
+		if (rcx::core::IsFeatureDisabled(kDetourFeature, &detoursReason))
+		{
+			detoursOff = detoursReason;
+		}
+		else if (!rcx::engine::Arm(kDetourFeature))
+		{
+			detoursOff = "the crash latch couldn't be armed";
+		}
+		else
+		{
+			detoursActive = true;
+			detoursArmed = true;
 		}
 
 		struct ThrowawayKind
@@ -1488,12 +2724,27 @@ namespace rcx::vr::bridge
 			if (firstModule && enumerator != nullptr)
 			{
 				adapterNames.clear();
+				adapterGpus.clear();
 
 				for (UINT adapter = 0; adapter < adapterCount; adapter++)
 				{
 					D3DADAPTER_IDENTIFIER9 identifier{};
-					std::string name = SUCCEEDED(enumerator->GetAdapterIdentifier(adapter, 0, &identifier)) ? std::string(identifier.Description) : std::string("unknown");
+					bool identified = SUCCEEDED(enumerator->GetAdapterIdentifier(adapter, 0, &identifier));
+					std::string name = identified ? std::string(identifier.Description) : std::string("unknown");
 					adapterNames.push_back(std::to_string(adapter) + ": " + name);
+					char gpu[64]{};
+					LUID luid{};
+
+					if (direct3dEx != nullptr && SUCCEEDED(direct3dEx->GetAdapterLUID(adapter, &luid)))
+					{
+						std::snprintf(gpu, sizeof(gpu), "luid %08lx:%08lx", static_cast<unsigned long>(luid.HighPart), static_cast<unsigned long>(luid.LowPart));
+					}
+					else
+					{
+						std::snprintf(gpu, sizeof(gpu), "pci %04lx:%04lx", static_cast<unsigned long>(identifier.VendorId), static_cast<unsigned long>(identifier.DeviceId));
+					}
+
+					adapterGpus.push_back(gpu);
 				}
 			}
 
@@ -1570,6 +2821,53 @@ namespace rcx::vr::bridge
 			SafeRelease(direct3d);
 		}
 
+		// D3D9On12 (Windows' Direct3D 9 on Direct3D 12) can give the game a device of its own class: its throwaways too.
+		auto create9On12Ex = reinterpret_cast<PFN_Direct3DCreate9On12Ex>(reinterpret_cast<void*>(GetProcAddress(d3d9Modules.front(), "Direct3DCreate9On12Ex")));
+		IDirect3D9Ex* direct3d9On12 = nullptr;
+		D3D9ON12_ARGS on12Arguments{};
+		on12Arguments.Enable9On12 = TRUE;
+
+		if (create9On12Ex != nullptr && SUCCEEDED(create9On12Ex(D3D_SDK_VERSION, &on12Arguments, 1, &direct3d9On12)) && direct3d9On12 != nullptr)
+		{
+			const DWORD on12Flags[] = {D3DCREATE_SOFTWARE_VERTEXPROCESSING, D3DCREATE_HARDWARE_VERTEXPROCESSING};
+
+			for (DWORD vertexFlags : on12Flags)
+			{
+				D3DPRESENT_PARAMETERS parameters{};
+				parameters.Windowed = TRUE;
+				parameters.SwapEffect = D3DSWAPEFFECT_DISCARD;
+				parameters.BackBufferFormat = D3DFMT_UNKNOWN;
+				parameters.BackBufferWidth = 1;
+				parameters.BackBufferHeight = 1;
+				parameters.hDeviceWindow = window;
+				IDirect3DDevice9Ex* device = nullptr;
+
+				if (FAILED(direct3d9On12->CreateDeviceEx(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window, vertexFlags | D3DCREATE_NOWINDOWCHANGES | D3DCREATE_FPU_PRESERVE, &parameters,
+					nullptr, &device)) || device == nullptr)
+				{
+					continue;
+				}
+
+				std::string label = vertexFlags == D3DCREATE_SOFTWARE_VERTEXPROCESSING ? "D3D9On12 software" : "D3D9On12 hardware";
+				HookVtable(device, true, label);
+				IDirect3DSwapChain9* chain = nullptr;
+
+				if (SUCCEEDED(device->GetSwapChain(0, &chain)) && chain != nullptr)
+				{
+					HookSwapChain(chain, label);
+					chain->Release();
+				}
+
+				device->Release();
+			}
+
+			direct3d9On12->Release();
+		}
+		else
+		{
+			rcx::core::Log("vr: no D3D9On12 throwaway device (Direct3DCreate9On12Ex %s)", create9On12Ex != nullptr ? "failed" : "isn't exported");
+		}
+
 		DestroyWindow(window);
 
 		if (vtableCount.load() == 0)
@@ -1579,7 +2877,9 @@ namespace rcx::vr::bridge
 		}
 
 		hooksInstalled = true;
-		rcx::core::Log("vr: Direct3D 9 hooks installed");
+		FindGameDevice();
+		rcx::core::Log("vr: Direct3D 9 hooks installed (%s)", detoursActive ? (std::to_string(detoursInstalled) + " detours, " + std::to_string(detoursRefused) + " refused").c_str()
+			: ("vtables only: " + detoursOff).c_str());
 		return true;
 	}
 
@@ -1610,16 +2910,34 @@ namespace rcx::vr::bridge
 		int32_t newAdapterIndex = -1;
 		system->GetDXGIOutputInfo(&newAdapterIndex);
 		headsetAdapter = system->GetD3D9AdapterIndex();
+		::vr::ETrackedPropertyError propertyError = ::vr::TrackedProp_Success;
+		float refresh = system->GetFloatTrackedDeviceProperty(::vr::k_unTrackedDeviceIndex_Hmd, ::vr::Prop_DisplayFrequency_Float, &propertyError);
 
 		{
-			std::lock_guard<std::mutex> lock(deviceMutex);
+			std::unique_lock<std::timed_mutex> lock(deviceMutex, std::defer_lock);
+
+			if (!lock.try_lock_for(kLuaLockLimit))
+			{
+				reason = "the game's render thread is stuck in the graphics driver (the VR hand-off couldn't be taken over)";
+				return false;
+			}
+
 			compositor = newCompositor;
 			adapterIndex = newAdapterIndex;
 			stats.framesSubmitted = 0;
+			stats.staleFrames = 0;
+			stats.alreadySubmitted = 0;
+			stats.framesNotReady = 0;
 			stats.submitErrors = 0;
 			stats.drawsWithoutSubmit = 0;
 			stats.framesSkipped = 0;
 			stats.waitTimeouts = 0;
+			stats.lateSubmits = 0;
+			stats.presentsPerSecond = 0.0;
+			stats.submitsPerSecond = 0.0;
+			stats.waitsPerSecond = 0.0;
+			rateWindowStart = {};
+			headsetFrameMs = propertyError == ::vr::TrackedProp_Success && refresh > 20.0f ? 1000.0 / refresh : 1000.0 / 90.0;
 			stats.maxWaitMs = 0.0;
 			stats.averageWaitMs = 0.0;
 			stats.lastError.clear();
@@ -1633,6 +2951,8 @@ namespace rcx::vr::bridge
 
 		queuedDropped = 0;
 		presentsWaitingForDraw = 0;
+		tripped = false;
+		slowSubmits = 0;
 		sessionActive = true;
 		return true;
 	}
@@ -1655,7 +2975,18 @@ namespace rcx::vr::bridge
 			}
 		}
 
-		std::lock_guard<std::mutex> lock(deviceMutex);
+		std::unique_lock<std::timed_mutex> lock(deviceMutex, std::defer_lock);
+
+		if (!lock.try_lock_for(kLuaLockLimit))
+		{
+			// The render thread is stuck in a driver call; with the session inactive it queues no frame, so it
+			// never reaches the compositor again. Its objects are released when it next presents.
+			releaseRequested = true;
+			rcx::core::Log("vr: the render thread was busy for over %lld ms at the session end; its VR objects are released at its next present",
+				static_cast<long long>(kLuaLockLimit.count()));
+			return;
+		}
+
 		compositor = nullptr;
 		ReleaseCompositorObjects();
 		releaseRequested = true;
@@ -1699,13 +3030,14 @@ namespace rcx::vr::bridge
 
 		const Layer layers[] = {
 			{L"vulkan-1.dll", "Vulkan (DXVK or an overlay)"},
+			{L"d3d9on12.dll", "D3D9On12 (Windows can run Direct3D 9 on Direct3D 12; the game device's functions say whether it does here)"},
 			{L"ReShade64.dll", "ReShade"},
 			{L"dxgi.dll", "DXGI"},
 			{L"GameOverlayRenderer64.dll", "Steam overlay"},
 			{L"DiscordHook64.dll", "Discord overlay"},
 			{L"RTSSHooks64.dll", "RivaTuner"},
 			{L"graphics-hook64.dll", "OBS game capture"},
-			{L"nvspcap64.dll", "NVIDIA overlay"},
+			{L"nvspcap64.dll", "NVIDIA capture (nvspcap64.dll: the driver loads it for ShadowPlay and the overlay, so it doesn't mean the overlay is on)"},
 			{L"SpecialK64.dll", "Special K"},
 		};
 
@@ -1720,6 +3052,22 @@ namespace rcx::vr::bridge
 		}
 
 		text += "; loaded: " + (loaded.empty() ? std::string("no known overlay or graphics layer") : loaded);
+		std::string modules;
+
+		for (const auto& entry : LoadedModules())
+		{
+			const std::string& name = entry.first;
+			bool graphics = name.compare(0, 2, "nv") == 0 || name.find("d3d9") != std::string::npos || name.find("optimus") != std::string::npos ||
+				name.find("wrap") != std::string::npos || name.find("reshade") != std::string::npos || name.find("dxvk") != std::string::npos ||
+				name.find("shaderapi") != std::string::npos || name.find("igd") == 0 || name.find("amd") == 0 || name.find("ati") == 0;
+
+			if (graphics)
+			{
+				modules += (modules.empty() ? "" : ", ") + entry.second;
+			}
+		}
+
+		text += "; graphics modules: " + (modules.empty() ? std::string("none") : modules);
 		return text;
 	}
 
@@ -1751,12 +3099,31 @@ namespace rcx::vr::bridge
 		int headset = headsetAdapter.load();
 		int game = gameAdapter.load();
 
+		auto gpuOf = [](int adapter) -> std::string
+		{
+			return adapter >= 0 && static_cast<size_t>(adapter) < adapterGpus.size() ? adapterGpus[adapter] : std::string();
+		};
+
 		if (game >= 0 && headset >= 0)
 		{
-			return game != headset;
+			return gpuOf(game) != gpuOf(headset);
 		}
 
-		return gameDevice.load() == nullptr && adapterNames.size() > 1;
+		size_t gpus = 0;
+
+		for (size_t index = 0; index < adapterGpus.size(); index++)
+		{
+			bool seen = false;
+
+			for (size_t before = 0; before < index; before++)
+			{
+				seen = seen || adapterGpus[before] == adapterGpus[index];
+			}
+
+			gpus += seen ? 0 : 1;
+		}
+
+		return gameDevice.load() == nullptr && gpus > 1;
 	}
 
 	void GetAdapters(int& headset, int& game, int& count)
@@ -1764,6 +3131,59 @@ namespace rcx::vr::bridge
 		headset = headsetAdapter.load();
 		game = gameAdapter.load();
 		count = static_cast<int>(adapterNames.size());
+	}
+
+	std::string DxgiAdapterName(const LUID& luid)
+	{
+		HMODULE dxgi = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+		using CreateFactoryFunction = HRESULT(WINAPI*)(REFIID, void**);
+		auto createFactory = dxgi != nullptr ? reinterpret_cast<CreateFactoryFunction>(reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1"))) : nullptr;
+		IDXGIFactory1* factory = nullptr;
+		std::string name = "an unknown GPU";
+
+		if (createFactory != nullptr && SUCCEEDED(createFactory(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory != nullptr)
+		{
+			IDXGIAdapter1* adapter = nullptr;
+
+			for (UINT index = 0; SUCCEEDED(factory->EnumAdapters1(index, &adapter)); index++)
+			{
+				DXGI_ADAPTER_DESC1 description{};
+
+				if (SUCCEEDED(adapter->GetDesc1(&description)) && description.AdapterLuid.LowPart == luid.LowPart && description.AdapterLuid.HighPart == luid.HighPart)
+				{
+					name = Narrow(description.Description) + " (DXGI adapter " + std::to_string(index) + ")";
+				}
+
+				adapter->Release();
+			}
+
+			factory->Release();
+		}
+
+		return name;
+	}
+
+	std::string DescribeDetours()
+	{
+		if (!detoursActive)
+		{
+			return "no detours (" + (detoursOff.empty() ? std::string("hooks not installed") : detoursOff) + ")";
+		}
+
+		return std::to_string(detoursInstalled) + " detours (" + std::to_string(detoursChained) + " chained onto another program's), " + std::to_string(detoursRefused) +
+			" refused";
+	}
+
+	std::string DetourReport()
+	{
+		std::string text;
+
+		for (const std::string& line : detourReport)
+		{
+			text += (text.empty() ? "" : "; ") + line;
+		}
+
+		return text;
 	}
 
 	std::string DescribeHooks()
@@ -1787,13 +3207,35 @@ namespace rcx::vr::bridge
 		std::string device = gameDevice.load() == nullptr
 			? "the game's device hasn't presented through any of the " + std::to_string(count) + " hooked device vtables (" + tables + ") or " +
 				std::to_string(swapChainCount.load()) + " swap chain vtables"
-			: "the game's device presents through the " + (game >= 0 ? vtables[game].label : std::string("unknown")) + " vtable (" + std::to_string(presents) + " presents, " +
-				std::to_string(swapChainPresents.load()) + " through its swap chain)";
+			: "the game's device, found by " + deviceFoundBy + ", is on the " + (game >= 0 ? vtables[game].label + " vtable, its functions in " + vtables[game].owner : std::string("unknown vtable")) + " (" + std::to_string(presents) +
+				" presents, " + std::to_string(swapChainPresents.load()) + " through its swap chain)";
+		device += "; the device scan: " + (scanResult.empty() ? std::string("not run") : scanResult);
+		IDirect3DDevice9* found = gameDevice.load();
+
+		if (found != nullptr && gameOn12.empty())
+		{
+			LUID luid{};
+
+			if (!D3D12AdapterLuid(found, luid))
+			{
+				gameOn12 = "not on D3D9On12";
+			}
+			else
+			{
+				gameOn12 = "on D3D9On12, its Direct3D 12 device on " + DxgiAdapterName(luid);
+			}
+		}
+
+		if (!gameOn12.empty())
+		{
+			device += "; the game's device is " + gameOn12;
+		}
 
 		char limit[64]{};
 		std::snprintf(limit, sizeof(limit), "%ux%u", maxTextureWidth.load(), maxTextureHeight.load());
 		return device + "; texture limit " + (maxTextureWidth.load() > 0 ? std::string(limit) : std::string("not read")) + "; " +
-			std::to_string(armedBinds.load()) + " render targets bound while armed; " + DescribeAdapters() + "; " + DescribeGraphicsLayers();
+			std::to_string(armedBinds.load()) + " render targets bound while armed; " + DescribeDetours() +
+			(gameVptrOwner.empty() ? std::string() : "; the device's vtable is in " + gameVptrOwner) + "; " + DescribeAdapters() + "; " + DescribeGraphicsLayers();
 	}
 
 	bool EndCapture(std::string& reason, std::string& kind)
@@ -1846,6 +3288,7 @@ namespace rcx::vr::bridge
 
 			lastFailureKind = kind;
 			reason = "no eye texture of " + std::to_string(width) + "x" + std::to_string(height) + " was captured: " + detail + "; " + DescribeHooks();
+			rcx::core::LogToFile("EndTarget failed (%s): %s", kind.c_str(), reason.c_str());
 			return false;
 		}
 
@@ -1861,9 +3304,33 @@ namespace rcx::vr::bridge
 		return true;
 	}
 
+	bool Tripped(std::string& reason)
+	{
+		if (!tripped.load())
+		{
+			return false;
+		}
+
+		std::lock_guard<std::mutex> lock(tripMutex);
+		reason = tripReason;
+		return true;
+	}
+
+	uint64_t SubmittedFrames()
+	{
+		return submittedCount.load();
+	}
+
 	void NoteWait()
 	{
 		waitCount++;
+
+		if (detoursArmed && presentCount.load() >= kCleanPresents)
+		{
+			detoursArmed = false;
+			rcx::engine::Disarm(kDetourFeature);
+			rcx::core::Log("vr: the detours ran %llu presents cleanly; their crash latch is cleared", static_cast<unsigned long long>(presentCount.load()));
+		}
 	}
 
 	bool QueueSubmit(uint32_t frameId, const ::vr::HmdMatrix34_t& headPose, std::string& reason)
@@ -1897,9 +3364,15 @@ namespace rcx::vr::bridge
 
 		PendingFrame frame{};
 		frame.frameId = frameId;
+		frame.wait = waitCount.load();
 		frame.headPose = headPose;
 		pending.push_back(frame);
 		return true;
+	}
+
+	void SetSubmitWait(double milliseconds)
+	{
+		askedSubmitWaitMs = milliseconds < 0.0 ? -1.0 : milliseconds;
 	}
 
 	void SetBounds(int eye, const TextureBounds& newBounds)
@@ -1933,6 +3406,7 @@ namespace rcx::vr::bridge
 		copy.eyeHeight = eyeHeight;
 		copy.eyeFormat = eyeFormat;
 		copy.capturedVia = capturedVia.load();
+		copy.nestedPresents = nestedPresents.load();
 		copy.lastCaptureFailure = lastFailureKind;
 		copy.hooks = DescribeHooks();
 		return copy;

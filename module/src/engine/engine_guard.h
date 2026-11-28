@@ -36,6 +36,11 @@ namespace rcx::engine
 	// `dlls` are file names in the game's bin/win64. Call once per feature, at module open.
 	void RegisterEngineFeature(const char* feature, const std::vector<std::string>& dlls);
 
+	// A feature that hooks Windows' own DLLs rather than the game's (vr_detours patches d3d9.dll): no build
+	// clearance, since those change with every Windows update, but the policy file, the crash latch and the
+	// player's convar apply as for an engine feature.
+	void RegisterSystemFeature(const char* feature);
+
 	std::vector<FeatureBuild> GetBuilds();
 	bool IsEngineFeature(const std::string& feature);
 
@@ -44,5 +49,10 @@ namespace rcx::engine
 	// keeps the feature off until ClearLatch (the player's options) removes it.
 	bool Arm(const char* feature);
 	void DisarmAll();
+
+	// Removes one feature's latch file this session wrote, once the risky step it guarded is over (vr_device_scan
+	// after the scan, vr_detours after the hooks have run cleanly), so a crash later in the session doesn't keep it
+	// off at the next load.
+	void Disarm(const char* feature);
 	bool ClearLatch(const std::string& feature, std::string& reason);
 }

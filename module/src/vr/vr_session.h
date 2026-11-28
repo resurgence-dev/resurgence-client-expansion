@@ -51,6 +51,25 @@ namespace rcx::vr
 		EyeDisplay eyes[2]{};
 	};
 
+	/*
+		rcx 0.79, frame pacing from SteamVR's side, updated once a second from WaitFrame: the headset's refresh
+		rate, the average WaitGetPoses time, the compositor's new frames, reprojected and dropped frames per
+		second (GetCumulativeStats), and from the last frame's timing the frames SteamVR is throttling the game
+		by (1: every other headset frame) and predicting ahead.
+	*/
+	struct Pacing
+	{
+		double headsetHz = 0.0;
+		double waitPosesMs = 0.0;
+		double compositorFramesPerSecond = 0.0;
+		double reprojectedPerSecond = 0.0;
+		double droppedPerSecond = 0.0;
+		uint32_t throttledFrames = 0;
+		uint32_t predictedFrames = 0;
+	};
+
+	Pacing GetPacing();
+
 	void RegisterFeature();
 
 	bool IsHeadsetPresent(std::string& reason);

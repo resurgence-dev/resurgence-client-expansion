@@ -35,6 +35,21 @@ namespace rcx::vr
 		bool keyboardOpen = false;
 		bool running = false;
 		bool detached = false;
+
+		// WaitFrame's checks (rcx 0.78): waits since a frame last reached the compositor, and slow waits in a row.
+		constexpr uint64_t kMaxWaitsWithoutSubmit = 600;
+		constexpr double kSlowWaitMs = 1500.0;
+		constexpr int kSlowWaitCount = 3;
+		uint64_t waitsWithoutSubmit = 0;
+		uint64_t lastSubmitted = 0;
+		int slowWaits = 0;
+
+		// Frame pacing (rcx 0.79): the published numbers, WaitGetPoses' running average, and the compositor's
+		// cumulative counts at the last update.
+		Pacing pacing{};
+		double waitPosesAverageMs = 0.0;
+		::vr::Compositor_CumulativeStats lastCumulative{};
+		std::chrono::steady_clock::time_point lastPacingUpdate{};
 		constexpr float kGridFadeSeconds = 0.4f;
 		std::vector<Event> queuedEvents;
 
@@ -402,12 +417,119 @@ namespace rcx::vr
 		return true;
 	}
 
+	namespace
+	{
+		// The hooks report and the stats, into the session log only.
+		void LogState(const char* when)
+		{
+			rcx::vr::bridge::Stats stats = rcx::vr::bridge::GetStats();
+			rcx::core::LogToFile("%s: backend %s; %s", when, stats.backend.c_str(), stats.compositorAdapter.c_str());
+			rcx::core::LogToFile("%s: hooks: %s", when, stats.hooks.c_str());
+			rcx::core::LogToFile("%s: detours: %s", when, rcx::vr::bridge::DetourReport().c_str());
+		}
+
+		std::chrono::steady_clock::time_point sessionStart{};
+		std::chrono::steady_clock::time_point lastStatsLine{};
+		bool stateLoggedAfterStart = false;
+
+		// Once a second: the compositor's side of the frame pacing.
+		void UpdatePacing(std::chrono::steady_clock::time_point now)
+		{
+			if (vrCompositor == nullptr)
+			{
+				return;
+			}
+
+			::vr::Compositor_CumulativeStats cumulative{};
+			vrCompositor->GetCumulativeStats(&cumulative, sizeof(cumulative));
+			double seconds = std::chrono::duration<double>(now - lastPacingUpdate).count();
+			bool first = lastPacingUpdate == std::chrono::steady_clock::time_point{} || seconds <= 0.0 || cumulative.m_nNumFramePresents < lastCumulative.m_nNumFramePresents;
+
+			pacing.compositorFramesPerSecond = first ? 0.0 : (cumulative.m_nNumFramePresents - lastCumulative.m_nNumFramePresents) / seconds;
+			pacing.reprojectedPerSecond = first ? 0.0 : (cumulative.m_nNumReprojectedFrames - lastCumulative.m_nNumReprojectedFrames) / seconds;
+			pacing.droppedPerSecond = first ? 0.0 : (cumulative.m_nNumDroppedFrames - lastCumulative.m_nNumDroppedFrames) / seconds;
+			lastCumulative = cumulative;
+			lastPacingUpdate = now;
+
+			::vr::Compositor_FrameTiming timing{};
+			timing.m_nSize = sizeof(timing);
+
+			if (vrCompositor->GetFrameTiming(&timing, 0))
+			{
+				pacing.throttledFrames = (timing.m_nReprojectionFlags & ::vr::VRCompositor_ThrottleMask) >> 8;
+				pacing.predictedFrames = (timing.m_nReprojectionFlags & ::vr::VRCompositor_PredictionMask) >> 4;
+			}
+
+			pacing.waitPosesMs = waitPosesAverageMs;
+		}
+
+		// Once a second from WaitFrame: the counters a frozen or slow session shows.
+		void LogStatsLine()
+		{
+			auto now = std::chrono::steady_clock::now();
+
+			if (now - lastStatsLine < std::chrono::seconds(1))
+			{
+				return;
+			}
+
+			lastStatsLine = now;
+			UpdatePacing(now);
+			rcx::vr::bridge::Stats stats = rcx::vr::bridge::GetStats();
+			rcx::core::LogToFile("pacing: headset %.1f Hz; game presents %.1f/s, submitted %.1f/s, Lua waits %.1f/s, WaitGetPoses %.2f ms; SteamVR %.1f frames/s, "
+				"reprojected %.1f/s, dropped %.1f/s, throttling by %u, predicting %u ahead; late submits %llu, submit wait %.1f ms (timed out %llu)",
+				pacing.headsetHz, stats.presentsPerSecond, stats.submitsPerSecond, stats.waitsPerSecond, pacing.waitPosesMs, pacing.compositorFramesPerSecond,
+				pacing.reprojectedPerSecond, pacing.droppedPerSecond, pacing.throttledFrames, pacing.predictedFrames, static_cast<unsigned long long>(stats.lateSubmits),
+				stats.submitWaitLimitMs, static_cast<unsigned long long>(stats.waitTimeouts));
+			rcx::core::LogToFile("stats: presents %llu, submitted %llu, skipped %llu, stale %llu, not ready %llu, already submitted %llu, submit errors %llu, "
+				"wait timeouts %llu, last submit %.2f ms, copy seen done after %.2f ms (average %.2f, max %.2f), backend %s, last error: %s",
+				static_cast<unsigned long long>(stats.presents), static_cast<unsigned long long>(stats.framesSubmitted), static_cast<unsigned long long>(stats.framesSkipped),
+				static_cast<unsigned long long>(stats.staleFrames), static_cast<unsigned long long>(stats.framesNotReady), static_cast<unsigned long long>(stats.alreadySubmitted),
+				static_cast<unsigned long long>(stats.submitErrors), static_cast<unsigned long long>(stats.waitTimeouts), stats.lastSubmitMs, stats.lastWaitMs,
+				stats.averageWaitMs, stats.maxWaitMs, stats.backend.c_str(), stats.lastError.empty() ? "none" : stats.lastError.c_str());
+
+			if (!stateLoggedAfterStart && now - sessionStart > std::chrono::seconds(5))
+			{
+				stateLoggedAfterStart = true;
+				LogState("5 s in");
+			}
+		}
+	}
+
+	bool StartSession(std::string& reason);
+
 	bool Start(std::string& reason)
 	{
 		if (running)
 		{
 			return true;
 		}
+
+		std::string path;
+
+		if (rcx::core::OpenSessionLog(rcx::core::kVersion, path))
+		{
+			rcx::core::Log("vr: this session's log is %s (send it with any VR problem)", path.c_str());
+		}
+
+		bool started = StartSession(reason);
+
+		if (!started)
+		{
+			rcx::core::LogToFile("VR didn't start: %s", reason.c_str());
+			LogState("at the failed start");
+			return false;
+		}
+
+		sessionStart = std::chrono::steady_clock::now();
+		lastStatsLine = sessionStart;
+		stateLoggedAfterStart = false;
+		LogState("at the start");
+		return true;
+	}
+
+	bool StartSession(std::string& reason)
+	{
 
 		if (IsOff(reason))
 		{
@@ -521,7 +643,16 @@ namespace rcx::vr
 			pose = DevicePose{};
 		}
 
+		pacing = Pacing{};
+		::vr::ETrackedPropertyError refreshError = ::vr::TrackedProp_Success;
+		float refresh = vrSystem->GetFloatTrackedDeviceProperty(::vr::k_unTrackedDeviceIndex_Hmd, ::vr::Prop_DisplayFrequency_Float, &refreshError);
+		pacing.headsetHz = refreshError == ::vr::TrackedProp_Success ? refresh : 0.0;
+		waitPosesAverageMs = 0.0;
+		lastPacingUpdate = {};
 		running = true;
+		waitsWithoutSubmit = 0;
+		slowWaits = 0;
+		lastSubmitted = rcx::vr::bridge::SubmittedFrames();
 		rcx::core::Log("vr: session started");
 		return true;
 	}
@@ -533,6 +664,7 @@ namespace rcx::vr
 			return;
 		}
 
+		LogState("at the stop");
 		running = false;
 		detached = false;
 		rcx::vr::bridge::EndSession();
@@ -543,6 +675,11 @@ namespace rcx::vr
 	bool IsRunning()
 	{
 		return running;
+	}
+
+	Pacing GetPacing()
+	{
+		return pacing;
 	}
 
 	void Detach()
@@ -642,8 +779,44 @@ namespace rcx::vr
 			rcx::core::Log("vr: a lua state took the session over");
 		}
 
+		// rcx 0.78: stop rather than crawl into a freeze. The render thread's watchdog, then frames reaching the
+		// headset at all, then the wait itself (WaitGetPoses can't be interrupted, only measured).
+		LogStatsLine();
+
+		if (rcx::vr::bridge::Tripped(reason))
+		{
+			rcx::core::LogToFile("WaitFrame stopped VR: %s", reason.c_str());
+			return 0;
+		}
+
+		uint64_t submitted = rcx::vr::bridge::SubmittedFrames();
+		waitsWithoutSubmit = submitted != lastSubmitted ? 0 : waitsWithoutSubmit + 1;
+		lastSubmitted = submitted;
+
+		if (waitsWithoutSubmit > kMaxWaitsWithoutSubmit)
+		{
+			reason = "no frame reached the headset in " + std::to_string(waitsWithoutSubmit) + " frames, so VR was stopped (the graphics card or SteamVR isn't taking them)";
+			waitsWithoutSubmit = 0;
+			rcx::core::LogToFile("WaitFrame stopped VR: %s", reason.c_str());
+			return 0;
+		}
+
 		::vr::TrackedDevicePose_t renderPoses[::vr::k_unMaxTrackedDeviceCount]{};
+		auto waitStart = std::chrono::steady_clock::now();
 		::vr::EVRCompositorError error = vrCompositor->WaitGetPoses(renderPoses, ::vr::k_unMaxTrackedDeviceCount, nullptr, 0);
+		double waitMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+		slowWaits = waitMs > kSlowWaitMs ? slowWaits + 1 : 0;
+		waitPosesAverageMs = waitPosesAverageMs == 0.0 ? waitMs : waitPosesAverageMs * 0.95 + waitMs * 0.05;
+
+		if (slowWaits >= kSlowWaitCount)
+		{
+			char text[192]{};
+			std::snprintf(text, sizeof(text), "SteamVR's frame wait took over %.0f ms %d times in a row (the last %.0f ms), so VR was stopped", kSlowWaitMs, kSlowWaitCount, waitMs);
+			reason = text;
+			slowWaits = 0;
+			rcx::core::LogToFile("WaitFrame stopped VR: %s", reason.c_str());
+			return 0;
+		}
 
 		if (error != ::vr::VRCompositorError_None && error != ::vr::VRCompositorError_DoNotHaveFocus)
 		{
@@ -663,6 +836,7 @@ namespace rcx::vr
 
 		if (!PollRuntimeEvents())
 		{
+			rcx::core::LogToFile("WaitFrame: SteamVR is quitting");
 			Stop();
 			reason = "SteamVR is quitting";
 			return 0;

@@ -420,6 +420,32 @@ namespace rcx::engine
 		builds.push_back(build);
 	}
 
+	void RegisterSystemFeature(const char* feature)
+	{
+		rcx::core::RegisterFeature(feature);
+		rcx::core::ResetFeature(feature);
+
+		FeatureBuild build{};
+		build.feature = feature;
+		build.key = "windows";
+		build.cleared = true;
+		ApplyPolicy(build);
+		CheckLatch(build);
+
+		std::lock_guard<std::mutex> lock(stateMutex);
+
+		for (FeatureBuild& existing : builds)
+		{
+			if (existing.feature == build.feature)
+			{
+				existing = build;
+				return;
+			}
+		}
+
+		builds.push_back(build);
+	}
+
 	std::vector<FeatureBuild> GetBuilds()
 	{
 		std::lock_guard<std::mutex> lock(stateMutex);
@@ -484,6 +510,25 @@ namespace rcx::engine
 		std::lock_guard<std::mutex> lock(stateMutex);
 		armed.insert(feature);
 		return true;
+	}
+
+	void Disarm(const char* feature)
+	{
+		{
+			std::lock_guard<std::mutex> lock(stateMutex);
+
+			if (armed.erase(feature) == 0)
+			{
+				return;
+			}
+		}
+
+		std::wstring path = LatchPath(feature);
+
+		if (!path.empty())
+		{
+			DeleteFileW(path.c_str());
+		}
 	}
 
 	void DisarmAll()

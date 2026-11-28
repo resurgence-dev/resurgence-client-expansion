@@ -26,6 +26,7 @@ endif()
 add_library(gmcl_rcx SHARED
 	src/module.cpp
 	src/core/core.cpp
+	src/core/detour.cpp
 	src/vr/openvr_loader.cpp
 	src/vr/vr_session.cpp
 	src/vr/vr_input.cpp
@@ -102,3 +103,33 @@ target_compile_definitions(rcx_sys_memory_test PRIVATE WIN32_LEAN_AND_MEAN NOMIN
 target_compile_options(rcx_sys_memory_test PRIVATE /W4 /EHsc /permissive-)
 set_property(TARGET rcx_sys_memory_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set_target_properties(rcx_sys_memory_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${RCX_OUTPUT_DIR}/tests/$<0:>")
+
+# The x64 detour on hand-written functions in executable memory (tests/detour_test.cpp).
+add_executable(rcx_detour_test tests/detour_test.cpp src/core/detour.cpp)
+target_include_directories(rcx_detour_test PRIVATE src)
+target_compile_definitions(rcx_detour_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_compile_options(rcx_detour_test PRIVATE /W4 /EHsc /permissive-)
+set_property(TARGET rcx_detour_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_target_properties(rcx_detour_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${RCX_OUTPUT_DIR}/tests/$<0:>")
+
+# VR-42: the bridge finds a device whose vptr an overlay swapped to a copy (tests/bridge_vptr_test.cpp).
+add_executable(rcx_bridge_vptr_test tests/bridge_vptr_test.cpp src/vr/d3d9_bridge.cpp src/core/core.cpp src/core/detour.cpp src/engine/engine_guard.cpp)
+target_include_directories(rcx_bridge_vptr_test PRIVATE src "${RCX_OPENVR_DIR}/headers")
+target_compile_definitions(rcx_bridge_vptr_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_compile_options(rcx_bridge_vptr_test PRIVATE /W4 /EHsc /permissive-)
+set_property(TARGET rcx_bridge_vptr_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_target_properties(rcx_bridge_vptr_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${RCX_OUTPUT_DIR}/tests/$<0:>")
+
+# The D3D12 hand-off for a game device on D3D9On12, without SteamVR (tests/d3d9on12_test.cpp).
+add_executable(rcx_d3d9on12_test tests/d3d9on12_test.cpp)
+target_compile_definitions(rcx_d3d9on12_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_compile_options(rcx_d3d9on12_test PRIVATE /W4 /EHsc /permissive-)
+set_property(TARGET rcx_d3d9on12_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_target_properties(rcx_d3d9on12_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${RCX_OUTPUT_DIR}/tests/$<0:>")
+
+# The native path's hand-off without a CPU wait: a Direct3D 9Ex write ordered before a Direct3D 11 read of a shared texture (tests/shared_sync_test.cpp).
+add_executable(rcx_shared_sync_test tests/shared_sync_test.cpp)
+target_compile_definitions(rcx_shared_sync_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_compile_options(rcx_shared_sync_test PRIVATE /W4 /EHsc /permissive-)
+set_property(TARGET rcx_shared_sync_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_target_properties(rcx_shared_sync_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${RCX_OUTPUT_DIR}/tests/$<0:>")

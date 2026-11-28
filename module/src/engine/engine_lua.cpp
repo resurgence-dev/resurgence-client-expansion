@@ -176,6 +176,8 @@ namespace rcx::engine
 	void RegisterFeatures()
 	{
 		RegisterEngineFeature("mesh_combine", {"engine.dll", "datacache.dll", "studiorender.dll"});
+		RegisterSystemFeature("vr_detours");
+		RegisterSystemFeature("vr_device_scan");
 	}
 
 	void PushTable(ILuaBase* lua)
